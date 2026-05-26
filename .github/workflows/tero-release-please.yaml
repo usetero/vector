@@ -1,0 +1,44 @@
+---
+# Release Please — Tero fork
+#
+# Watches `master` for commits using the Conventional Commits format and
+# opens a "release PR" that bumps the prerelease version (.X-tero.N → .X-tero.N+1)
+# and updates `Cargo.toml`, `CHANGELOG.md`, and `.release-please-manifest.json`.
+# Merging that PR creates the `v<version>` tag, which triggers
+# `tero-release.yaml` to publish artifacts.
+#
+# This is the Tero-fork equivalent of `tero-collector-distro`'s
+# `release-please.yaml`. Do not touch upstream Vector's `release.yml`.
+
+name: Tero release please
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    # Don't fire in the upstream `vectordotdev/vector` repo if this fork's
+    # `master` is ever pushed back upstream by accident.
+    if: github.repository_owner == 'usetero'
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        with:
+          # GITHUB_TOKEN works, but PRs it creates cannot trigger other
+          # workflows. If you want `tero-release.yaml` to fire when the
+          # release PR is merged (and the tag is pushed automatically), swap
+          # this for a PAT or GitHub App token. Today the tag push DOES
+          # trigger workflows because release-please pushes it directly.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

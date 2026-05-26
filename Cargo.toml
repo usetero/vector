@@ -338,6 +338,9 @@ prost-types = { workspace = true, optional = true }
 # Databricks Zerobus
 databricks-zerobus-ingest-sdk = { git = "https://github.com/databricks/zerobus-sdk-rs", rev = "273efe09130a7554e6b34d20b95df50289e58524", optional = true }
 
+# Tero Policy (policy-rs) — used by the `policy` transform.
+policy-rs = { git = "https://github.com/usetero/policy-rs", rev = "fc94f17312aa51019276c97f7fb57abf20089bf5", optional = true }
+
 # GCP
 goauth = { version = "0.16.0", optional = true }
 smpl_jwt = { version = "0.8.0", default-features = false, optional = true }
@@ -825,6 +828,7 @@ transforms-window = []
 transforms-log_to_metric = []
 transforms-lua = ["dep:mlua", "vector-lib/lua"]
 transforms-metric_to_log = []
+transforms-policy = ["dep:policy-rs"]
 transforms-reduce = ["transforms-impl-reduce"]
 transforms-remap = []
 transforms-route = []
