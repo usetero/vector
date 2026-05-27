@@ -48,8 +48,22 @@ pub struct PolicyConfig {
     #[configurable(derived)]
     pub policy_providers: Vec<PolicyProviderConfig>,
 
+    /// How Vector events are mapped to policy-rs records.
+    ///
+    /// `flat` (the default) treats every Vector event as a single log
+    /// record and uses the configurable `field_mapping`.
+    ///
+    /// `otel` treats every Vector event as an OTLP envelope and iterates
+    /// `resourceLogs[].scopeLogs[].logRecords[]` internally, applying
+    /// policies per-record and pruning empty children. `field_mapping`
+    /// is ignored in this mode — OTLP field locations are fixed by the
+    /// protocol.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub mode: PolicyMode,
+
     /// Mapping between `policy-rs` log field selectors and paths within a
-    /// Vector `LogEvent`.
+    /// Vector `LogEvent`. Only used when `mode = flat`.
     ///
     /// Defaults follow OpenTelemetry semantic conventions so logs produced
     /// by the `opentelemetry` source are matched without further
@@ -57,6 +71,30 @@ pub struct PolicyConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub field_mapping: FieldMapping,
+}
+
+/// Iteration mode for the `policy` transform.
+#[configurable_component]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyMode {
+    /// One Vector event maps to one log record. Use this mode for sources
+    /// that emit flat Vector events (the default for most sources).
+    ///
+    /// Policy field selectors are resolved through `field_mapping`.
+    #[default]
+    Flat,
+
+    /// One Vector event is an OTLP envelope (`{ resourceLogs: [...] }`).
+    ///
+    /// The transform iterates every `logRecord` inside the envelope,
+    /// applies policies per-record, and prunes empty `scopeLogs` and
+    /// `resourceLogs` entries. If every record is filtered out, the
+    /// entire envelope event is dropped.
+    ///
+    /// Use this mode with Vector's `opentelemetry` source when
+    /// `use_otlp_decoding.logs` is `true`.
+    Otel,
 }
 
 /// Policy provider configuration.
@@ -107,6 +145,7 @@ impl GenerateConfig for PolicyConfig {
                 "local",
                 "/etc/vector/policies.json",
             )],
+            mode: PolicyMode::default(),
             field_mapping: FieldMapping::default(),
         })
         .unwrap()
@@ -142,6 +181,7 @@ impl TransformConfig for PolicyConfig {
             Arc::new(registry),
             Arc::new(PolicyEngine::new()),
             Arc::new(self.field_mapping.clone()),
+            self.mode,
         );
         Ok(Transform::event_task(policy))
     }

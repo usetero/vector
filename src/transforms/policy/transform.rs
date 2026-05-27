@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
-use policy_rs::{EvaluateResult, PolicyEngine, PolicyRegistry};
+use policy_rs::{EvaluateResult, PolicyEngine, PolicyRegistry, PolicySnapshot};
 use vector_lib::transform::TaskTransform;
 
-use crate::event::Event;
+use crate::event::{Event, LogEvent};
 
 use super::adapter::VectorLogAdapter;
+use super::config::PolicyMode;
 use super::field_mapping::FieldMapping;
 use super::internal_events::{DropReason, emit_dropped};
+use super::otlp_adapter::evaluate_envelope;
 
 /// Per-task state for the `policy` transform.
 ///
@@ -24,6 +26,7 @@ pub struct Policy {
     registry: Arc<PolicyRegistry>,
     engine: Arc<PolicyEngine>,
     mapping: Arc<FieldMapping>,
+    mode: PolicyMode,
 }
 
 impl Policy {
@@ -31,11 +34,13 @@ impl Policy {
         registry: Arc<PolicyRegistry>,
         engine: Arc<PolicyEngine>,
         mapping: Arc<FieldMapping>,
+        mode: PolicyMode,
     ) -> Self {
         Self {
             registry,
             engine,
             mapping,
+            mode,
         }
     }
 }
@@ -51,55 +56,77 @@ impl TaskTransform<Event> for Policy {
         let registry = Arc::clone(&self.registry);
         let engine = Arc::clone(&self.engine);
         let mapping = Arc::clone(&self.mapping);
+        let mode = self.mode;
 
         Box::pin(stream! {
             while let Some(event) = input_rx.next().await {
                 match event {
-                    Event::Log(mut log) => {
+                    Event::Log(log) => {
                         // Pull a fresh snapshot every event so live-reloaded
                         // policies take effect on the next pass. Snapshots
                         // are cheap (Arc clone of an immutable inner).
                         let snapshot = registry.snapshot();
-                        let result = {
-                            let mut adapter = VectorLogAdapter::new(&mut log, &mapping);
-                            engine.evaluate_and_transform(&snapshot, &mut adapter).await
+                        let outcome = match mode {
+                            PolicyMode::Flat => {
+                                evaluate_flat(&engine, &snapshot, &mapping, log).await
+                            }
+                            PolicyMode::Otel => {
+                                evaluate_envelope(&engine, &snapshot, log).await
+                            }
                         };
-                        match result {
-                            Ok(EvaluateResult::NoMatch)
-                            | Ok(EvaluateResult::Keep { .. })
-                            | Ok(EvaluateResult::Sample { keep: true, .. })
-                            | Ok(EvaluateResult::RateLimit { allowed: true, .. }) => {
-                                yield Event::Log(log);
-                            }
-                            Ok(EvaluateResult::Drop { .. }) => {
-                                emit_dropped(DropReason::PolicyDrop);
-                            }
-                            Ok(EvaluateResult::Sample { keep: false, .. }) => {
-                                emit_dropped(DropReason::SampleRejected);
-                            }
-                            Ok(EvaluateResult::RateLimit { allowed: false, .. }) => {
-                                emit_dropped(DropReason::RateLimited);
-                            }
-                            Err(error) => {
-                                // Fail open: an evaluation error shouldn't
-                                // silently drop telemetry. Log and pass the
-                                // event through untouched.
-                                error!(
-                                    message = "Policy evaluation failed; event passed through unchanged.",
-                                    %error,
-                                );
-                                yield Event::Log(log);
-                            }
+                        if let Some(forwarded) = outcome {
+                            yield Event::Log(forwarded);
                         }
                     }
                     other => {
                         // policy-rs only targets the log signal in this
                         // integration. Metrics and traces are forwarded
-                        // untouched.
+                        // untouched regardless of mode.
                         yield other;
                     }
                 }
             }
         })
+    }
+}
+
+/// Flat-mode evaluation: one Vector event = one log record. Returns
+/// `Some(log)` to forward, `None` to drop.
+async fn evaluate_flat(
+    engine: &PolicyEngine,
+    snapshot: &PolicySnapshot,
+    mapping: &FieldMapping,
+    mut log: LogEvent,
+) -> Option<LogEvent> {
+    let result = {
+        let mut adapter = VectorLogAdapter::new(&mut log, mapping);
+        engine.evaluate_and_transform(snapshot, &mut adapter).await
+    };
+    match result {
+        Ok(EvaluateResult::NoMatch)
+        | Ok(EvaluateResult::Keep { .. })
+        | Ok(EvaluateResult::Sample { keep: true, .. })
+        | Ok(EvaluateResult::RateLimit { allowed: true, .. }) => Some(log),
+        Ok(EvaluateResult::Drop { .. }) => {
+            emit_dropped(DropReason::PolicyDrop);
+            None
+        }
+        Ok(EvaluateResult::Sample { keep: false, .. }) => {
+            emit_dropped(DropReason::SampleRejected);
+            None
+        }
+        Ok(EvaluateResult::RateLimit { allowed: false, .. }) => {
+            emit_dropped(DropReason::RateLimited);
+            None
+        }
+        Err(error) => {
+            // Fail open: an evaluation error shouldn't silently drop
+            // telemetry. Log and pass the event through untouched.
+            error!(
+                message = "Policy evaluation failed; event passed through unchanged.",
+                %error,
+            );
+            Some(log)
+        }
     }
 }

@@ -9,6 +9,7 @@
 mod adapter;
 mod field_mapping;
 mod internal_events;
+mod otlp_adapter;
 
 pub mod config;
 pub mod transform;

@@ -9,16 +9,18 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
+use serde_json::json;
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use vector_lib::config::LogNamespace;
 use vector_lib::event::{LogEvent, Metric, MetricKind, MetricValue};
 
 use crate::event::{Event, Value};
 use crate::test_util::components::init_test;
 use crate::transforms::test::create_topology;
 
-use super::config::{PolicyConfig, PolicyProviderConfig};
+use super::config::{PolicyConfig, PolicyMode, PolicyProviderConfig};
 use super::field_mapping::FieldMapping;
 
 /// Write `body` to a fresh NamedTempFile with the `.json` suffix and return
@@ -41,6 +43,19 @@ fn policy_config(path: &Path) -> PolicyConfig {
             "local",
             path.to_string_lossy().into_owned(),
         )],
+        mode: PolicyMode::Flat,
+        field_mapping: FieldMapping::default(),
+    }
+}
+
+#[allow(dead_code)]
+fn policy_config_otel(path: &Path) -> PolicyConfig {
+    PolicyConfig {
+        policy_providers: vec![PolicyProviderConfig::file(
+            "local",
+            path.to_string_lossy().into_owned(),
+        )],
+        mode: PolicyMode::Otel,
         field_mapping: FieldMapping::default(),
     }
 }
@@ -1405,6 +1420,538 @@ async fn rate_limit_per_minute_first_event_passes() {
 
     tx.send(log("minutely event")).await.unwrap();
     let _ = recv(&mut out).await.expect("first /m event passes");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+// =============================================================================
+// OTel envelope-mode tests.
+//
+// These exercise the full envelope iteration path (resourceLogs[]→scopeLogs[]
+// →logRecords[]) — per-record filtering, pruning of empty children, and
+// dropping the whole event when all records are filtered out.
+// =============================================================================
+
+/// Build a single OTLP record body wrapped as an AnyValue.
+fn otlp_any_string(s: &str) -> serde_json::Value {
+    json!({ "stringValue": s })
+}
+
+/// Build a single OTLP attribute entry `{ key, value: { stringValue: ... } }`.
+fn otlp_attr(key: &str, value: &str) -> serde_json::Value {
+    json!({ "key": key, "value": otlp_any_string(value) })
+}
+
+/// Build an OTLP envelope with a single resourceLogs+scopeLogs entry and
+/// the supplied records inside.
+fn otlp_envelope(records: Vec<serde_json::Value>) -> Event {
+    Event::from_json_value(
+        json!({
+            "resourceLogs": [
+                {
+                    "resource": {
+                        "attributes": [
+                            otlp_attr("service.name", "test-service"),
+                        ]
+                    },
+                    "schemaUrl": "https://opentelemetry.io/schemas/test",
+                    "scopeLogs": [
+                        {
+                            "scope": {
+                                "name": "test.scope",
+                                "attributes": [
+                                    otlp_attr("library", "test-lib"),
+                                ]
+                            },
+                            "schemaUrl": "https://opentelemetry.io/schemas/test",
+                            "logRecords": records
+                        }
+                    ]
+                }
+            ]
+        }),
+        LogNamespace::Legacy,
+    )
+    .expect("valid envelope")
+}
+
+/// Build a minimal OTLP log record with the given body string.
+fn otlp_record(body: &str) -> serde_json::Value {
+    json!({
+        "severityText": "INFO",
+        "body": otlp_any_string(body),
+        "attributes": []
+    })
+}
+
+const OTEL_POLICY_DROP_DEBUG: &str = r#"{
+  "policies": [
+    {
+      "id": "drop-debug",
+      "name": "drop-debug",
+      "log": {
+        "match": [{ "log_field": "body", "regex": "debug" }],
+        "keep": "none"
+      }
+    }
+  ]
+}"#;
+
+#[tokio::test]
+async fn otel_mode_passes_non_envelope_event_through() {
+    // Backwards-compat: if someone configures `mode: otel` but routes a
+    // non-envelope (flat) event through it, we forward it unchanged
+    // rather than silently dropping data.
+    let policies = write_policies(OTEL_POLICY_DROP_DEBUG);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let mut event = LogEvent::default();
+    event.insert("message", "not an envelope");
+    tx.send(event.into()).await.unwrap();
+
+    let received = recv(&mut out).await.expect("flat event passes through");
+    assert_eq!(
+        received.into_log().get("message").and_then(|v| v.as_str()),
+        Some("not an envelope".into()),
+    );
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_drops_single_matching_record() {
+    let policies = write_policies(OTEL_POLICY_DROP_DEBUG);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    // The single record matches `debug`, so it's filtered out — leaving
+    // an empty logRecords → empty scopeLogs → empty resourceLogs → the
+    // whole event is dropped.
+    let envelope = otlp_envelope(vec![otlp_record("debug message")]);
+    tx.send(envelope).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_filters_some_records_keeps_envelope() {
+    let policies = write_policies(OTEL_POLICY_DROP_DEBUG);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = otlp_envelope(vec![
+        otlp_record("info message"),
+        otlp_record("debug message"),
+        otlp_record("warn message"),
+        otlp_record("another debug here"),
+    ]);
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("envelope forwarded");
+    let log = received.into_log();
+
+    // Drill into resourceLogs[0].scopeLogs[0].logRecords and verify only
+    // the two non-debug records remained.
+    let records = log
+        .get("resourceLogs")
+        .and_then(|v| v.as_array())
+        .and_then(|rl| rl.first())
+        .and_then(|rl| rl.get("scopeLogs"))
+        .and_then(|v| v.as_array())
+        .and_then(|sl| sl.first())
+        .and_then(|sl| sl.get("logRecords"))
+        .and_then(|v| v.as_array())
+        .expect("records array still present");
+    assert_eq!(records.len(), 2);
+
+    let bodies: Vec<String> = records
+        .iter()
+        .filter_map(|r| {
+            r.get("body")
+                .and_then(|b| b.get("stringValue"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.into_owned())
+        })
+        .collect();
+    assert_eq!(bodies, vec!["info message", "warn message"]);
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_prunes_empty_scope_logs() {
+    let policies = write_policies(OTEL_POLICY_DROP_DEBUG);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    // Two scopeLogs entries: the first has only matching records, the
+    // second has a non-matching record. The first entry should be pruned.
+    let envelope = Event::from_json_value(
+        json!({
+            "resourceLogs": [
+                {
+                    "scopeLogs": [
+                        {
+                            "scope": { "name": "scope-a" },
+                            "logRecords": [
+                                otlp_record("debug 1"),
+                                otlp_record("debug 2"),
+                            ]
+                        },
+                        {
+                            "scope": { "name": "scope-b" },
+                            "logRecords": [
+                                otlp_record("info kept"),
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }),
+        LogNamespace::Legacy,
+    )
+    .unwrap();
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("envelope forwarded");
+    let log = received.into_log();
+
+    let scope_logs = log
+        .get("resourceLogs")
+        .and_then(|v| v.as_array())
+        .and_then(|rl| rl.first())
+        .and_then(|rl| rl.get("scopeLogs"))
+        .and_then(|v| v.as_array())
+        .expect("scopeLogs still present");
+    assert_eq!(scope_logs.len(), 1, "empty scope must be pruned");
+    let scope_name = scope_logs[0]
+        .get("scope")
+        .and_then(|s| s.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|s| s.into_owned());
+    assert_eq!(scope_name.as_deref(), Some("scope-b"));
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_prunes_empty_resource_logs() {
+    let policies = write_policies(OTEL_POLICY_DROP_DEBUG);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    // Two resourceLogs entries. The first ends up empty after filtering;
+    // the second still has a record. Expect: only the second remains.
+    let envelope = Event::from_json_value(
+        json!({
+            "resourceLogs": [
+                {
+                    "resource": { "attributes": [ otlp_attr("service.name", "dropped") ] },
+                    "scopeLogs": [
+                        {
+                            "scope": { "name": "s" },
+                            "logRecords": [ otlp_record("debug a") ]
+                        }
+                    ]
+                },
+                {
+                    "resource": { "attributes": [ otlp_attr("service.name", "kept") ] },
+                    "scopeLogs": [
+                        {
+                            "scope": { "name": "s" },
+                            "logRecords": [ otlp_record("info b") ]
+                        }
+                    ]
+                }
+            ]
+        }),
+        LogNamespace::Legacy,
+    )
+    .unwrap();
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("envelope forwarded");
+    let log = received.into_log();
+
+    let resource_logs = log
+        .get("resourceLogs")
+        .and_then(|v| v.as_array())
+        .expect("resourceLogs present");
+    assert_eq!(
+        resource_logs.len(),
+        1,
+        "empty resource entry must be pruned"
+    );
+
+    let service = resource_logs[0]
+        .get("resource")
+        .and_then(|r| r.get("attributes"))
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|kv| kv.get("value"))
+        .and_then(|v| v.get("stringValue"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.into_owned());
+    assert_eq!(service.as_deref(), Some("kept"));
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_resource_attribute_matcher_drops_record() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-service",
+          "name": "drop-by-service",
+          "log": {
+            "match": [{ "resource_attribute": "service.name", "exact": "noisy-service" }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = Event::from_json_value(
+        json!({
+            "resourceLogs": [
+                {
+                    "resource": { "attributes": [ otlp_attr("service.name", "noisy-service") ] },
+                    "scopeLogs": [
+                        {
+                            "scope": { "name": "s" },
+                            "logRecords": [ otlp_record("hello") ]
+                        }
+                    ]
+                }
+            ]
+        }),
+        LogNamespace::Legacy,
+    )
+    .unwrap();
+    tx.send(envelope).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_scope_attribute_matcher_drops_record() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-lib",
+          "name": "drop-by-lib",
+          "log": {
+            "match": [{ "scope_attribute": "library", "exact": "deprecated-tracer" }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = Event::from_json_value(
+        json!({
+            "resourceLogs": [
+                {
+                    "scopeLogs": [
+                        {
+                            "scope": { "attributes": [ otlp_attr("library", "deprecated-tracer") ] },
+                            "logRecords": [ otlp_record("hello") ]
+                        }
+                    ]
+                }
+            ]
+        }),
+        LogNamespace::Legacy,
+    )
+    .unwrap();
+    tx.send(envelope).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_redact_mutates_attribute_array() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "redact-secret",
+          "name": "redact-secret",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "login" }],
+            "keep": "all",
+            "transform": {
+              "redact": [
+                { "log_attribute": "password", "replacement": "[REDACTED]" }
+              ]
+            }
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = otlp_envelope(vec![json!({
+        "severityText": "INFO",
+        "body": otlp_any_string("user login attempt"),
+        "attributes": [
+            otlp_attr("password", "super-secret"),
+            otlp_attr("user", "alice"),
+        ]
+    })]);
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("envelope forwarded");
+    let log = received.into_log();
+
+    let attrs = log
+        .get("resourceLogs")
+        .and_then(|v| v.as_array())
+        .and_then(|rl| rl.first())
+        .and_then(|rl| rl.get("scopeLogs"))
+        .and_then(|v| v.as_array())
+        .and_then(|sl| sl.first())
+        .and_then(|sl| sl.get("logRecords"))
+        .and_then(|v| v.as_array())
+        .and_then(|r| r.first())
+        .and_then(|r| r.get("attributes"))
+        .and_then(|v| v.as_array())
+        .expect("attributes array present");
+
+    let password = attrs
+        .iter()
+        .find(|a| a.get("key").and_then(|k| k.as_str()).as_deref() == Some("password"));
+    let password_val = password
+        .and_then(|a| a.get("value"))
+        .and_then(|v| v.get("stringValue"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.into_owned());
+    assert_eq!(password_val.as_deref(), Some("[REDACTED]"));
+
+    // Untouched attribute stays put.
+    let user_val = attrs
+        .iter()
+        .find(|a| a.get("key").and_then(|k| k.as_str()).as_deref() == Some("user"))
+        .and_then(|a| a.get("value"))
+        .and_then(|v| v.get("stringValue"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.into_owned());
+    assert_eq!(user_val.as_deref(), Some("alice"));
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_add_inserts_attribute_into_array() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "tag-processed",
+          "name": "tag-processed",
+          "log": {
+            "match": [{ "log_field": "body", "regex": ".+" }],
+            "keep": "all",
+            "transform": {
+              "add": [
+                { "log_attribute": "processed_by", "value": "vector", "upsert": false }
+              ]
+            }
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = otlp_envelope(vec![otlp_record("anything")]);
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("envelope forwarded");
+    let log = received.into_log();
+
+    let attrs = log
+        .get("resourceLogs")
+        .and_then(|v| v.as_array())
+        .and_then(|rl| rl.first())
+        .and_then(|rl| rl.get("scopeLogs"))
+        .and_then(|v| v.as_array())
+        .and_then(|sl| sl.first())
+        .and_then(|sl| sl.get("logRecords"))
+        .and_then(|v| v.as_array())
+        .and_then(|r| r.first())
+        .and_then(|r| r.get("attributes"))
+        .and_then(|v| v.as_array())
+        .expect("attributes array present");
+
+    let processed_by = attrs
+        .iter()
+        .find(|a| a.get("key").and_then(|k| k.as_str()).as_deref() == Some("processed_by"))
+        .and_then(|a| a.get("value"))
+        .and_then(|v| v.get("stringValue"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.into_owned());
+    assert_eq!(processed_by.as_deref(), Some("vector"));
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_severity_text_matcher_drops_record() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-debug-severity",
+          "name": "drop-debug-severity",
+          "log": {
+            "match": [{ "log_field": "severity_text", "exact": "DEBUG" }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = otlp_envelope(vec![json!({
+        "severityText": "DEBUG",
+        "body": otlp_any_string("anything"),
+        "attributes": []
+    })]);
+    tx.send(envelope).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_metric_event_passes_through_untouched() {
+    // Same guarantee as flat mode: non-log signals are forwarded as-is.
+    let policies = write_policies(OTEL_POLICY_DROP_DEBUG);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let metric = Event::from(Metric::new(
+        "test",
+        MetricKind::Incremental,
+        MetricValue::Counter { value: 1.0 },
+    ));
+    tx.send(metric).await.unwrap();
+    let received = recv(&mut out).await.expect("metric passes through");
+    assert!(matches!(received, Event::Metric(_)));
 
     drop(tx);
     topology.stop().await;
