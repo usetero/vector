@@ -95,12 +95,15 @@ jobs:
             build-essential \
             clang \
             cmake \
+            libboost-dev \
             libclang-dev \
             libpcre2-dev \
+            libprotobuf-dev \
             libsasl2-dev \
             libssl-dev \
             libxml2-dev \
             pkg-config \
+            protobuf-compiler \
             ragel \
             unzip
           # `target-*-linux-gnu` pulls in `vendored` which builds krb5/gssapi

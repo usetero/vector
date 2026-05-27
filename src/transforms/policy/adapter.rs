@@ -633,4 +633,236 @@ mod tests {
             Some("42"),
         );
     }
+
+    // --- Simple-field exhaustive coverage --------------------------------
+    //
+    // Every `LogField` variant goes through the same `simple_path` table.
+    // The cases below confirm get/set/delete behave consistently across
+    // every variant we expose (Body and SeverityText already had bespoke
+    // tests; these round out the rest).
+
+    /// One get/delete/set cycle for a simple field. Helper rather than
+    /// per-variant duplication so future `LogField` additions just append a
+    /// caller below.
+    fn assert_simple_round_trip(field: LogField, event_path: &str) {
+        let m = mapping();
+
+        // get
+        let mut log = LogEvent::default();
+        log.insert(event_path, "initial");
+        {
+            let adapter = VectorLogAdapter::new(&mut log, &m);
+            assert_eq!(
+                adapter
+                    .get_field(&LogFieldSelector::Simple(field))
+                    .as_deref(),
+                Some("initial"),
+                "get failed for {field:?} at {event_path:?}",
+            );
+        }
+
+        // delete
+        let was_present = {
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.delete_field(&LogFieldSelector::Simple(field))
+        };
+        assert!(was_present, "delete returned false for {field:?}");
+        assert!(
+            log.get(event_path).is_none(),
+            "delete left {event_path:?} present for {field:?}",
+        );
+
+        // set
+        {
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.set_field(&LogFieldSelector::Simple(field), "after-set");
+        }
+        assert_eq!(
+            log.get(event_path).and_then(|v| v.as_str()),
+            Some("after-set".into()),
+            "set didn't insert at {event_path:?} for {field:?}",
+        );
+    }
+
+    #[test]
+    fn round_trip_simple_body() {
+        assert_simple_round_trip(LogField::Body, "message");
+    }
+
+    #[test]
+    fn round_trip_simple_severity_text() {
+        assert_simple_round_trip(LogField::SeverityText, "severity_text");
+    }
+
+    #[test]
+    fn round_trip_simple_trace_id() {
+        assert_simple_round_trip(LogField::TraceId, "trace_id");
+    }
+
+    #[test]
+    fn round_trip_simple_span_id() {
+        assert_simple_round_trip(LogField::SpanId, "span_id");
+    }
+
+    #[test]
+    fn round_trip_simple_event_name() {
+        assert_simple_round_trip(LogField::EventName, "event_name");
+    }
+
+    #[test]
+    fn round_trip_simple_resource_schema_url() {
+        assert_simple_round_trip(LogField::ResourceSchemaUrl, "resource.schema_url");
+    }
+
+    #[test]
+    fn round_trip_simple_scope_schema_url() {
+        assert_simple_round_trip(LogField::ScopeSchemaUrl, "scope.schema_url");
+    }
+
+    // --- Resource / scope attribute Transformable coverage ---------------
+    //
+    // `LogAttribute` is already covered in detail. These mirror the same
+    // operations for the resource and scope namespaces so the namespace
+    // dispatch in `path_for` is exercised end-to-end.
+
+    #[test]
+    fn set_resource_attribute_flat() {
+        let mut log = LogEvent::default();
+        {
+            let m = mapping();
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.set_field(
+                &LogFieldSelector::ResourceAttribute(vec!["region".to_string()]),
+                "us-east-1",
+            );
+        }
+        assert_eq!(
+            log.get("resource.attributes.region")
+                .and_then(|v| v.as_str()),
+            Some("us-east-1".into()),
+        );
+    }
+
+    #[test]
+    fn set_resource_attribute_nested() {
+        let mut log = LogEvent::default();
+        {
+            let m = mapping();
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.set_field(
+                &LogFieldSelector::ResourceAttribute(vec!["k8s".to_string(), "pod".to_string()]),
+                "vector-0",
+            );
+        }
+        assert_eq!(
+            log.get("resource.attributes.k8s.pod")
+                .and_then(|v| v.as_str()),
+            Some("vector-0".into()),
+        );
+    }
+
+    #[test]
+    fn delete_resource_attribute() {
+        let mut log = LogEvent::default();
+        log.insert("resource.attributes.region", "us-east-1");
+        let was_present = {
+            let m = mapping();
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.delete_field(&LogFieldSelector::ResourceAttribute(vec![
+                "region".to_string(),
+            ]))
+        };
+        assert!(was_present);
+        assert!(log.get("resource.attributes.region").is_none());
+    }
+
+    #[test]
+    fn move_resource_attribute_within_namespace() {
+        let mut log = LogEvent::default();
+        log.insert("resource.attributes.zone", "ap-south-1a");
+        {
+            let m = mapping();
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.move_field(
+                &LogFieldSelector::ResourceAttribute(vec!["zone".to_string()]),
+                &LogFieldSelector::ResourceAttribute(vec!["availability_zone".to_string()]),
+            );
+        }
+        assert!(log.get("resource.attributes.zone").is_none());
+        assert_eq!(
+            log.get("resource.attributes.availability_zone")
+                .and_then(|v| v.as_str()),
+            Some("ap-south-1a".into()),
+        );
+    }
+
+    #[test]
+    fn set_scope_attribute_flat() {
+        let mut log = LogEvent::default();
+        {
+            let m = mapping();
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.set_field(
+                &LogFieldSelector::ScopeAttribute(vec!["lib_version".to_string()]),
+                "1.2.3",
+            );
+        }
+        assert_eq!(
+            log.get("scope.attributes.lib_version")
+                .and_then(|v| v.as_str()),
+            Some("1.2.3".into()),
+        );
+    }
+
+    #[test]
+    fn set_scope_attribute_nested() {
+        let mut log = LogEvent::default();
+        {
+            let m = mapping();
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.set_field(
+                &LogFieldSelector::ScopeAttribute(vec!["vendor".to_string(), "name".to_string()]),
+                "otel",
+            );
+        }
+        assert_eq!(
+            log.get("scope.attributes.vendor.name")
+                .and_then(|v| v.as_str()),
+            Some("otel".into()),
+        );
+    }
+
+    #[test]
+    fn delete_scope_attribute() {
+        let mut log = LogEvent::default();
+        log.insert("scope.attributes.lib_version", "1.2.3");
+        let was_present = {
+            let m = mapping();
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.delete_field(&LogFieldSelector::ScopeAttribute(vec![
+                "lib_version".to_string(),
+            ]))
+        };
+        assert!(was_present);
+        assert!(log.get("scope.attributes.lib_version").is_none());
+    }
+
+    #[test]
+    fn move_scope_attribute_within_namespace() {
+        let mut log = LogEvent::default();
+        log.insert("scope.attributes.legacy", "x");
+        {
+            let m = mapping();
+            let mut adapter = VectorLogAdapter::new(&mut log, &m);
+            adapter.move_field(
+                &LogFieldSelector::ScopeAttribute(vec!["legacy".to_string()]),
+                &LogFieldSelector::ScopeAttribute(vec!["renamed".to_string()]),
+            );
+        }
+        assert!(log.get("scope.attributes.legacy").is_none());
+        assert_eq!(
+            log.get("scope.attributes.renamed").and_then(|v| v.as_str()),
+            Some("x".into()),
+        );
+    }
 }

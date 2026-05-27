@@ -8483,9 +8483,11 @@ dependencies = [
  "prost-build 0.13.5",
  "rand 0.8.5",
  "regex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
+ "tonic 0.12.3",
  "tonic-build 0.12.3",
  "vectorscan-rs-sys",
 ]

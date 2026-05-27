@@ -18,7 +18,7 @@ use crate::event::{Event, Value};
 use crate::test_util::components::init_test;
 use crate::transforms::test::create_topology;
 
-use super::config::PolicyConfig;
+use super::config::{PolicyConfig, PolicyProviderConfig};
 use super::field_mapping::FieldMapping;
 
 /// Write `body` to a fresh NamedTempFile with the `.json` suffix and return
@@ -37,7 +37,10 @@ fn write_policies(body: &str) -> NamedTempFile {
 
 fn policy_config(path: &Path) -> PolicyConfig {
     PolicyConfig {
-        policies_path: path.to_path_buf(),
+        policy_providers: vec![PolicyProviderConfig::file(
+            "local",
+            path.to_string_lossy().into_owned(),
+        )],
         field_mapping: FieldMapping::default(),
     }
 }
@@ -201,11 +204,11 @@ const POLICY_REMOVE_DEBUG_TRACE: &str = r#"{
   ]
 }"#;
 
-const POLICY_RENAME_LEGACY: &str = r#"{
+const POLICY_RENAME_USER: &str = r#"{
   "policies": [
     {
-      "id": "rename-legacy",
-      "name": "rename-legacy",
+      "id": "rename-user",
+      "name": "rename-user",
       "log": {
         "match": [
           { "log_field": "body", "regex": ".+" }
@@ -448,7 +451,7 @@ async fn remove_deletes_field() {
 
 #[tokio::test]
 async fn rename_moves_field() {
-    let policies = write_policies(POLICY_RENAME_LEGACY);
+    let policies = write_policies(POLICY_RENAME_USER);
     let config = policy_config(policies.path());
 
     let (tx, mut out, topology) = build_topology(config).await;
@@ -671,6 +674,737 @@ async fn non_string_attribute_satisfies_exists_matcher() {
     event.insert("severity_text", "INFO");
     tx.send(event.into()).await.unwrap();
     let _ = recv(&mut out).await.expect("missing count -> pass through");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+// =============================================================================
+// Matcher-type coverage. Each test confirms that a single matcher variant
+// (other than `regex`/`exists`, which already had their own tests above)
+// drives a `keep: "none"` policy as expected.
+// =============================================================================
+
+/// Build a one-policy `keep: "none"` JSON document from a single matcher
+/// expressed as a raw JSON snippet (e.g. `r#""exact": "foo""#`). Keeps the
+/// matcher tests tiny while still exercising the full deserialize → compile
+/// → evaluate chain.
+fn drop_policy_with_matcher(matcher_json: &str) -> String {
+    format!(
+        r#"{{
+  "policies": [
+    {{
+      "id": "drop",
+      "name": "drop",
+      "log": {{
+        "match": [{{ "log_field": "body", {matcher_json} }}],
+        "keep": "none"
+      }}
+    }}
+  ]
+}}"#
+    )
+}
+
+#[tokio::test]
+async fn exact_match_drops_on_full_string_equal() {
+    let policies = write_policies(&drop_policy_with_matcher(r#""exact": "hello""#));
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    tx.send(log("hello")).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    // A non-exact match (substring) must NOT drop.
+    tx.send(log("hello world")).await.unwrap();
+    let _ = recv(&mut out).await.expect("non-exact body passes through");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn starts_with_match_drops() {
+    let policies = write_policies(&drop_policy_with_matcher(r#""starts_with": "DEBUG:""#));
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    tx.send(log("DEBUG: trace info")).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    tx.send(log("INFO: app started")).await.unwrap();
+    let _ = recv(&mut out)
+        .await
+        .expect("non-prefix body passes through");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn ends_with_match_drops() {
+    let policies = write_policies(&drop_policy_with_matcher(
+        r#""ends_with": "[health-check]""#,
+    ));
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    tx.send(log("ping [health-check]")).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    tx.send(log("user request received")).await.unwrap();
+    let _ = recv(&mut out)
+        .await
+        .expect("non-suffix body passes through");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn contains_match_drops() {
+    let policies = write_policies(&drop_policy_with_matcher(r#""contains": "secret""#));
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    tx.send(log("user said the secret word")).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    tx.send(log("nothing sensitive here")).await.unwrap();
+    let _ = recv(&mut out)
+        .await
+        .expect("non-substring body passes through");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn negate_inverts_match_outcome() {
+    // Drop everything EXCEPT events whose body equals "keep".
+    let policies = write_policies(&drop_policy_with_matcher(
+        r#""exact": "keep", "negate": true"#,
+    ));
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    tx.send(log("anything")).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    tx.send(log("keep")).await.unwrap();
+    let _ = recv(&mut out)
+        .await
+        .expect("negated match keeps the matching body");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn case_insensitive_match_drops_regardless_of_case() {
+    let policies = write_policies(&drop_policy_with_matcher(
+        r#""regex": "error", "case_insensitive": true"#,
+    ));
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    for body in ["ERROR boom", "Error boom", "error boom", "ErRoR boom"] {
+        tx.send(log(body)).await.unwrap();
+        assert_no_event(&mut out).await;
+    }
+
+    drop(tx);
+    topology.stop().await;
+}
+
+// =============================================================================
+// Match-field namespace coverage: each policy field selector resolves to a
+// LogEvent path, and we want one drop-policy test per supported selector to
+// catch any regression in the adapter's `path_for` dispatch.
+// =============================================================================
+
+#[tokio::test]
+async fn severity_text_matcher_drops() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-debug-severity",
+          "name": "drop-debug-severity",
+          "log": {
+            "match": [{ "log_field": "severity_text", "exact": "DEBUG" }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "anything");
+    e.insert("severity_text", "DEBUG");
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    tx.send(log("anything")).await.unwrap(); // severity_text = INFO
+    let _ = recv(&mut out).await.expect("non-DEBUG passes");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn trace_id_matcher_drops() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-trace",
+          "name": "drop-by-trace",
+          "log": {
+            "match": [{ "log_field": "trace_id", "exists": true }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert("trace_id", "abc123");
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    tx.send(log("x")).await.unwrap(); // no trace_id
+    let _ = recv(&mut out).await.expect("no trace_id passes");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn span_id_matcher_drops() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-span",
+          "name": "drop-by-span",
+          "log": {
+            "match": [{ "log_field": "span_id", "exists": true }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert("span_id", "def456");
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn event_name_matcher_drops() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-event-name",
+          "name": "drop-by-event-name",
+          "log": {
+            "match": [{ "log_field": "event_name", "exact": "noisy.event" }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert("event_name", "noisy.event");
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn resource_schema_url_matcher_drops() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-resource-schema",
+          "name": "drop-by-resource-schema",
+          "log": {
+            "match": [{ "log_field": "resource_schema_url", "contains": "v1.0" }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert(
+        "resource.schema_url",
+        "https://opentelemetry.io/schemas/v1.0",
+    );
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn scope_schema_url_matcher_drops() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-scope-schema",
+          "name": "drop-by-scope-schema",
+          "log": {
+            "match": [{ "log_field": "scope_schema_url", "exists": true }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert("scope.schema_url", "https://opentelemetry.io/schemas/foo");
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn resource_attribute_matcher_drops() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-service",
+          "name": "drop-by-service",
+          "log": {
+            "match": [{ "resource_attribute": "service.name", "exact": "noisy-service" }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    // The OTel-style "service.name" attribute key contains a literal dot,
+    // so we insert through a typed path that quotes the segment.
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert(r#"resource.attributes."service.name""#, "noisy-service");
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn scope_attribute_matcher_drops() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-by-scope-attr",
+          "name": "drop-by-scope-attr",
+          "log": {
+            "match": [{ "scope_attribute": "library", "exact": "deprecated-tracer" }],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert("scope.attributes.library", "deprecated-tracer");
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+// =============================================================================
+// Multi-policy and multi-matcher semantics.
+// =============================================================================
+
+#[tokio::test]
+async fn multiple_match_clauses_are_anded() {
+    // Drops only when BOTH the body matches AND the severity matches.
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "drop-error-from-frontend",
+          "name": "drop-error-from-frontend",
+          "log": {
+            "match": [
+              { "log_field": "body", "regex": "error" },
+              { "log_field": "severity_text", "exact": "ERROR" }
+            ],
+            "keep": "none"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    // Both clauses match -> dropped.
+    let mut e = LogEvent::default();
+    e.insert("message", "an error occurred");
+    e.insert("severity_text", "ERROR");
+    tx.send(e.into()).await.unwrap();
+    assert_no_event(&mut out).await;
+
+    // Body matches but severity does not -> passes through.
+    let mut e = LogEvent::default();
+    e.insert("message", "an error occurred");
+    e.insert("severity_text", "INFO");
+    tx.send(e.into()).await.unwrap();
+    let _ = recv(&mut out)
+        .await
+        .expect("AND fails on severity mismatch");
+
+    // Severity matches but body does not -> passes through.
+    let mut e = LogEvent::default();
+    e.insert("message", "all good");
+    e.insert("severity_text", "ERROR");
+    tx.send(e.into()).await.unwrap();
+    let _ = recv(&mut out).await.expect("AND fails on body mismatch");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn transforms_from_all_matching_policies_apply() {
+    // Two policies both match the same event. The keep action comes from
+    // the winning policy (one of them), but per the policy-rs engine, the
+    // transforms from BOTH matching policies are applied.
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "a-redact-secret",
+          "name": "a-redact-secret",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "audit" }],
+            "keep": "all",
+            "transform": {
+              "redact": [
+                { "log_attribute": "secret", "replacement": "[REDACTED]" }
+              ]
+            }
+          }
+        },
+        {
+          "id": "b-add-processed-by",
+          "name": "b-add-processed-by",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "audit" }],
+            "keep": "all",
+            "transform": {
+              "add": [
+                { "log_attribute": "processed_by", "value": "vector", "upsert": false }
+              ]
+            }
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "audit event");
+    e.insert("severity_text", "INFO");
+    e.insert("attributes.secret", "hunter2");
+    tx.send(e.into()).await.unwrap();
+
+    let received = recv(&mut out).await.expect("event forwarded");
+    let log = received.into_log();
+    assert_eq!(
+        log.get("attributes.secret").and_then(|v| v.as_str()),
+        Some("[REDACTED]".into()),
+        "redact from policy A should have applied",
+    );
+    assert_eq!(
+        log.get("attributes.processed_by").and_then(|v| v.as_str()),
+        Some("vector".into()),
+        "add from policy B should have applied",
+    );
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn winning_policy_determines_keep_action() {
+    // Two policies both match. One says "keep: all", the other "keep: none".
+    // The engine sorts policies by ID alphabetically and selects a winner
+    // for the keep decision; for this test we just assert the event ends up
+    // in *some* deterministic state. Because the engine's choice is stable,
+    // we accept either outcome as long as it's consistent across the batch.
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "aaa-drop",
+          "name": "aaa-drop",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "contested" }],
+            "keep": "none"
+          }
+        },
+        {
+          "id": "zzz-keep",
+          "name": "zzz-keep",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "contested" }],
+            "keep": "all"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    // Send a batch — every event must take the same path. If the winner is
+    // unstable across events the batch would mix drops and passes, which is
+    // what this test rules out.
+    for _ in 0..5 {
+        tx.send(log("contested event")).await.unwrap();
+    }
+    let first = tokio::time::timeout(Duration::from_millis(500), out.recv()).await;
+    let dropped_consistently = first.is_err();
+    let kept_consistently = first.as_ref().map(|r| r.is_some()).unwrap_or(false);
+
+    if kept_consistently {
+        // First event was kept; the remaining four must also be kept.
+        for _ in 0..4 {
+            let _ = recv(&mut out)
+                .await
+                .expect("remaining contested events kept");
+        }
+    } else if dropped_consistently {
+        // First event was dropped; the remaining four must also be dropped.
+        assert_no_event(&mut out).await;
+    } else {
+        panic!("ambiguous outcome: first event returned None during run");
+    }
+
+    drop(tx);
+    topology.stop().await;
+}
+
+// =============================================================================
+// Transform-op variant coverage.
+// =============================================================================
+
+#[tokio::test]
+async fn redact_with_regex_redacts_substring_only() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "redact-cc",
+          "name": "redact-cc",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "card" }],
+            "keep": "all",
+            "transform": {
+              "redact": [
+                {
+                  "log_attribute": "card_number",
+                  "replacement": "X",
+                  "regex": "[0-9]"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "card event");
+    e.insert("severity_text", "INFO");
+    e.insert("attributes.card_number", "4242 1111 2222 3333");
+    tx.send(e.into()).await.unwrap();
+
+    let received = recv(&mut out).await.expect("event forwarded");
+    let log = received.into_log();
+    assert_eq!(
+        log.get("attributes.card_number").and_then(|v| v.as_str()),
+        Some("XXXX XXXX XXXX XXXX".into()),
+        "regex redact replaces each digit individually",
+    );
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn rename_without_upsert_skips_when_target_exists() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "rename-no-upsert",
+          "name": "rename-no-upsert",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "." }],
+            "keep": "all",
+            "transform": {
+              "rename": [
+                { "from_log_attribute": "usr", "to": "user_id", "upsert": false }
+              ]
+            }
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    // Target `user_id` already exists; rename without upsert must leave
+    // both keys in place (the source is NOT moved).
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert("attributes.usr", "admin");
+    e.insert("attributes.user_id", "existing");
+    tx.send(e.into()).await.unwrap();
+
+    let received = recv(&mut out).await.expect("event forwarded");
+    let log = received.into_log();
+    assert_eq!(
+        log.get("attributes.usr").and_then(|v| v.as_str()),
+        Some("admin".into()),
+        "source key must be preserved when upsert is false and target exists",
+    );
+    assert_eq!(
+        log.get("attributes.user_id").and_then(|v| v.as_str()),
+        Some("existing".into()),
+        "existing target must NOT be overwritten",
+    );
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn add_with_upsert_overwrites_existing_value() {
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "add-upsert",
+          "name": "add-upsert",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "." }],
+            "keep": "all",
+            "transform": {
+              "add": [
+                { "log_attribute": "processed_by", "value": "vector", "upsert": true }
+              ]
+            }
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let mut e = LogEvent::default();
+    e.insert("message", "x");
+    e.insert("severity_text", "INFO");
+    e.insert("attributes.processed_by", "something-else");
+    tx.send(e.into()).await.unwrap();
+
+    let received = recv(&mut out).await.expect("event forwarded");
+    assert_eq!(
+        received
+            .into_log()
+            .get("attributes.processed_by")
+            .and_then(|v| v.as_str()),
+        Some("vector".into()),
+        "upsert=true overwrites the existing value",
+    );
+
+    drop(tx);
+    topology.stop().await;
+}
+
+// =============================================================================
+// Misc: trace pass-through + rate-limit-per-minute parse + provider list.
+// =============================================================================
+
+#[tokio::test]
+async fn trace_event_passes_through_untouched() {
+    use vector_lib::event::TraceEvent;
+
+    let policies = write_policies(POLICY_DROP_DEBUG);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    let trace = Event::from(TraceEvent::default());
+    tx.send(trace).await.unwrap();
+
+    match recv(&mut out).await {
+        Some(Event::Trace(_)) => {}
+        other => panic!("expected trace passthrough, got {other:?}"),
+    }
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn rate_limit_per_minute_first_event_passes() {
+    // We can't realistically test the *reset* of a per-minute window in a
+    // unit test (it would have to wait 60s). This guards the parse path
+    // and confirms the first matching event is still forwarded.
+    let policy = r#"{
+      "policies": [
+        {
+          "id": "rate-limit-per-minute",
+          "name": "rate-limit-per-minute",
+          "log": {
+            "match": [{ "log_field": "body", "regex": "minutely" }],
+            "keep": "60/m"
+          }
+        }
+      ]
+    }"#;
+    let policies = write_policies(policy);
+    let (tx, mut out, topology) = build_topology(policy_config(policies.path())).await;
+
+    tx.send(log("minutely event")).await.unwrap();
+    let _ = recv(&mut out).await.expect("first /m event passes");
 
     drop(tx);
     topology.stop().await;
