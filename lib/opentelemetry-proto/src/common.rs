@@ -20,9 +20,6 @@ impl From<PBValue> for Value {
                     .collect::<Vec<Value>>(),
             ),
             PBValue::KvlistValue(arr) => kv_list_into_value(arr.values),
-            // String-table reference (profiles signal). We don't carry the
-            // referenced string table here, so there's nothing to resolve.
-            PBValue::StringValueStrindex(_) => Value::Null,
         }
     }
 }

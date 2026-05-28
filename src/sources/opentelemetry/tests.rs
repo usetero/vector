@@ -56,10 +56,8 @@ fn create_test_logs_request() -> Request<ExportLogsServiceRequest> {
     Request::new(ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             resource: Some(OtelResource {
-                entity_refs: vec![],
                 attributes: vec![KeyValue {
                     key: "res_key".into(),
-                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(StringValue("res_val".into())),
                     }),
@@ -72,7 +70,6 @@ fn create_test_logs_request() -> Request<ExportLogsServiceRequest> {
                     version: "1.2.3".into(),
                     attributes: vec![KeyValue {
                         key: "scope_attr".into(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("scope_val".into())),
                         }),
@@ -82,7 +79,6 @@ fn create_test_logs_request() -> Request<ExportLogsServiceRequest> {
                 log_records: vec![LogRecord {
                     time_unix_nano: 1,
                     observed_time_unix_nano: 2,
-                    event_name: String::new(),
                     severity_number: 9,
                     severity_text: "info".into(),
                     body: Some(AnyValue {
@@ -90,7 +86,6 @@ fn create_test_logs_request() -> Request<ExportLogsServiceRequest> {
                     }),
                     attributes: vec![KeyValue {
                         key: "attr_key".into(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("attr_val".into())),
                         }),
@@ -112,10 +107,8 @@ fn create_test_metrics_request() -> ExportMetricsServiceRequest {
     ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
-                entity_refs: vec![],
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
-                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(StringValue("vector-collector".to_string())),
                     }),
@@ -135,20 +128,17 @@ fn create_test_metrics_request() -> ExportMetricsServiceRequest {
                     name: "some.random.metric".to_string(),
                     description: "Some random metric we use for test".to_string(),
                     unit: "1".to_string(),
-                    metadata: vec![],
                     data: Some(Data::Summary(Summary {
                         data_points: vec![SummaryDataPoint {
                             attributes: vec![
                                 KeyValue {
                                     key: "host".to_string(),
-                                    key_strindex: 0,
                                     value: Some(AnyValue {
                                         value: Some(StringValue("localhost".to_string())),
                                     }),
                                 },
                                 KeyValue {
                                     key: "service".to_string(),
-                                    key_strindex: 0,
                                     value: Some(AnyValue {
                                         value: Some(StringValue("vector-collector".to_string())),
                                     }),
@@ -201,7 +191,6 @@ fn create_test_traces_request() -> ExportTraceServiceRequest {
                     dropped_events_count: 0,
                     links: vec![],
                     dropped_links_count: 0,
-                    flags: 0,
                     status: None,
                     trace_state: "".to_string(),
                 }],
@@ -393,10 +382,8 @@ async fn receive_sum_metric() {
         let req = Request::new(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    entity_refs: vec![],
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("vector-collector".to_string())),
                         }),
@@ -416,19 +403,16 @@ async fn receive_sum_metric() {
                         name: "some.random.metric".to_string(),
                         description: "Some random metric we use for test".to_string(),
                         unit: "1".to_string(),
-                        metadata: vec![],
                         data: Some(Data::Sum(Sum {
                             data_points: vec![NumberDataPoint {
                                 attributes: vec![
                                     KeyValue {
                                         key: "host".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("localhost".to_string())),
                                         }),
                                     }, KeyValue {
                                         key: "service".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("vector-collector".to_string())),
                                         }),
@@ -490,10 +474,8 @@ async fn receive_sum_non_monotonic_metric() {
         let req = Request::new(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    entity_refs: vec![],
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("vector-collector".to_string())),
                         }),
@@ -513,19 +495,16 @@ async fn receive_sum_non_monotonic_metric() {
                         name: "some.random.metric".to_string(),
                         description: "Some random metric we use for test".to_string(),
                         unit: "1".to_string(),
-                        metadata: vec![],
                         data: Some(Data::Sum(Sum {
                             data_points: vec![NumberDataPoint {
                                 attributes: vec![
                                     KeyValue {
                                         key: "host".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("localhost".to_string())),
                                         }),
                                     }, KeyValue {
                                         key: "service".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("vector-collector".to_string())),
                                         }),
@@ -587,10 +566,8 @@ async fn receive_gauge_metric() {
         let req = Request::new(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    entity_refs: vec![],
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("vector-collector".to_string())),
                         }),
@@ -610,19 +587,16 @@ async fn receive_gauge_metric() {
                         name: "some.random.metric".to_string(),
                         description: "Some random metric we use for test".to_string(),
                         unit: "1".to_string(),
-                        metadata: vec![],
                         data: Some(Data::Gauge(Gauge {
                             data_points: vec![NumberDataPoint {
                                 attributes: vec![
                                     KeyValue {
                                         key: "host".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("localhost".to_string())),
                                         }),
                                     }, KeyValue {
                                         key: "service".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("vector-collector".to_string())),
                                         }),
@@ -681,10 +655,8 @@ async fn receive_histogram_metric() {
         let req = Request::new(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    entity_refs: vec![],
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("vector-collector".to_string())),
                         }),
@@ -704,21 +676,18 @@ async fn receive_histogram_metric() {
                         name: "some.random.metric".to_string(),
                         description: "Some random metric we use for test".to_string(),
                         unit: "1".to_string(),
-                        metadata: vec![],
                         data: Some(Data::Histogram(Histogram {
                             aggregation_temporality: AggregationTemporality::Cumulative as i32,
                             data_points: vec![HistogramDataPoint {
                                 attributes: vec![
                                     KeyValue {
                                         key: "host".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("localhost".to_string())),
                                         }),
                                     },
                                     KeyValue {
                                         key: "service".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue(
                                                 "vector-collector".to_string(),
@@ -813,10 +782,8 @@ async fn receive_histogram_delta_metric() {
         let req = Request::new(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    entity_refs: vec![],
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("vector-collector".to_string())),
                         }),
@@ -836,21 +803,18 @@ async fn receive_histogram_delta_metric() {
                         name: "some.random.metric".to_string(),
                         description: "Some random metric we use for test".to_string(),
                         unit: "1".to_string(),
-                        metadata: vec![],
                         data: Some(Data::Histogram(Histogram {
                             aggregation_temporality: AggregationTemporality::Delta as i32,
                             data_points: vec![HistogramDataPoint {
                                 attributes: vec![
                                     KeyValue {
                                         key: "host".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("localhost".to_string())),
                                         }),
                                     },
                                     KeyValue {
                                         key: "service".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue(
                                                 "vector-collector".to_string(),
@@ -945,10 +909,8 @@ async fn receive_expontential_histogram_metric() {
         let req = Request::new(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    entity_refs: vec![],
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("vector-collector".to_string())),
                         }),
@@ -968,21 +930,18 @@ async fn receive_expontential_histogram_metric() {
                         name: "some.random.metric".to_string(),
                         description: "Some random metric we use for test".to_string(),
                         unit: "1".to_string(),
-                        metadata: vec![],
                         data: Some(Data::ExponentialHistogram(ExponentialHistogram {
                             aggregation_temporality: AggregationTemporality::Cumulative as i32,
                             data_points: vec![ExponentialHistogramDataPoint {
                                 attributes: vec![
                                     KeyValue {
                                         key: "host".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("localhost".to_string())),
                                         }),
                                     },
                                     KeyValue {
                                         key: "service".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue(
                                                 "vector-collector".to_string(),
@@ -1090,10 +1049,8 @@ async fn receive_summary_metric() {
         let req = Request::new(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    entity_refs: vec![],
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
-                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(StringValue("vector-collector".to_string())),
                         }),
@@ -1113,20 +1070,17 @@ async fn receive_summary_metric() {
                         name: "some.random.metric".to_string(),
                         description: "Some random metric we use for test".to_string(),
                         unit: "1".to_string(),
-                        metadata: vec![],
                         data: Some(Data::Summary(Summary {
                             data_points: vec![SummaryDataPoint {
                                 attributes: vec![
                                     KeyValue {
                                         key: "host".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue("localhost".to_string())),
                                         }),
                                     },
                                     KeyValue {
                                         key: "service".to_string(),
-                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(StringValue(
                                                 "vector-collector".to_string(),
@@ -1300,7 +1254,6 @@ async fn http_headers_logs_use_otlp_decoding_false() {
                     log_records: vec![LogRecord {
                         time_unix_nano: 1,
                         observed_time_unix_nano: 2,
-                        event_name: String::new(),
                         severity_number: 9,
                         severity_text: "info".into(),
                         body: Some(AnyValue {
@@ -1382,7 +1335,6 @@ async fn http_headers_logs_use_otlp_decoding_true() {
                     log_records: vec![LogRecord {
                         time_unix_nano: 1,
                         observed_time_unix_nano: 2,
-                        event_name: String::new(),
                         severity_number: 9,
                         severity_text: "info".into(),
                         body: Some(AnyValue {
@@ -1666,7 +1618,6 @@ async fn http_logs_use_otlp_decoding_emits_metric() {
                 log_records: vec![LogRecord {
                     time_unix_nano: 1,
                     observed_time_unix_nano: 2,
-                    event_name: String::new(),
                     severity_number: 9,
                     severity_text: "info".into(),
                     body: Some(AnyValue {

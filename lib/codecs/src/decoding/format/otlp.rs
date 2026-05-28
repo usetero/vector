@@ -246,7 +246,6 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![],
                     dropped_attributes_count: 0,
-                    entity_refs: vec![],
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: None,
@@ -261,7 +260,6 @@ mod tests {
                         trace_id: vec![],
                         span_id: vec![],
                         observed_time_unix_nano: 0,
-                        event_name: String::new(),
                     }],
                     schema_url: String::new(),
                 }],
@@ -278,7 +276,6 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![],
                     dropped_attributes_count: 0,
-                    entity_refs: vec![],
                 }),
                 scope_metrics: vec![ScopeMetrics {
                     scope: None,
@@ -286,7 +283,6 @@ mod tests {
                         name: "test_metric".to_string(),
                         description: String::new(),
                         unit: String::new(),
-                        metadata: vec![],
                         data: None,
                     }],
                     schema_url: String::new(),
@@ -304,7 +300,6 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![],
                     dropped_attributes_count: 0,
-                    entity_refs: vec![],
                 }),
                 scope_spans: vec![ScopeSpans {
                     scope: None,
@@ -324,7 +319,6 @@ mod tests {
                         links: vec![],
                         dropped_links_count: 0,
                         status: None,
-                        flags: 0,
                     }],
                     schema_url: String::new(),
                 }],
