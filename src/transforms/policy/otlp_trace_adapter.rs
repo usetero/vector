@@ -20,7 +20,7 @@ use policy_rs::{
 };
 use vector_lib::event::{TraceEvent, Value};
 
-use super::internal_events::{DropReason, emit_dropped};
+use super::internal_events::{DropCounts, DropReason};
 use super::otlp_adapter::{attribute_exists_path, find_attribute_path, non_empty};
 
 /// Iterate every span in an OTLP traces envelope, sampling/dropping in place.
@@ -40,9 +40,14 @@ pub(super) async fn evaluate_traces_envelope(
         return true;
     };
 
+    let mut drops = DropCounts::default();
     let mut i = 0;
     while i < resource_spans.len() {
-        let resource = resource_spans[i].get("resource").cloned();
+        // Lift resource/scope out (a move, not a clone) so the adapter can read
+        // them while we mutate the sibling `spans` array; re-attached after.
+        let resource = resource_spans[i]
+            .as_object_mut()
+            .and_then(|o| o.remove("resource"));
         let resource_schema_url = resource_spans[i].get("schemaUrl").cloned();
 
         let mut prune_rs = false;
@@ -53,7 +58,9 @@ pub(super) async fn evaluate_traces_envelope(
         {
             let mut j = 0;
             while j < scope_spans.len() {
-                let scope = scope_spans[j].get("scope").cloned();
+                let scope = scope_spans[j]
+                    .as_object_mut()
+                    .and_then(|o| o.remove("scope"));
                 let scope_schema_url = scope_spans[j].get("schemaUrl").cloned();
 
                 let mut prune_ss = false;
@@ -77,11 +84,11 @@ pub(super) async fn evaluate_traces_envelope(
 
                         let keep = match result {
                             Ok(EvaluateResult::Drop { .. }) => {
-                                emit_dropped(DropReason::PolicyDrop);
+                                drops.record(DropReason::PolicyDrop);
                                 false
                             }
                             Ok(EvaluateResult::Sample { keep: false, .. }) => {
-                                emit_dropped(DropReason::SampleRejected);
+                                drops.record(DropReason::SampleRejected);
                                 false
                             }
                             Ok(_) => true,
@@ -103,6 +110,13 @@ pub(super) async fn evaluate_traces_envelope(
                     prune_ss = spans.is_empty();
                 }
 
+                // Re-attach the (read-only) scope.
+                if let Some(scope) = scope
+                    && let Some(obj) = scope_spans[j].as_object_mut()
+                {
+                    obj.insert("scope".into(), scope);
+                }
+
                 if prune_ss {
                     scope_spans.remove(j);
                 } else {
@@ -112,6 +126,13 @@ pub(super) async fn evaluate_traces_envelope(
             prune_rs = scope_spans.is_empty();
         }
 
+        // Re-attach the (read-only) resource.
+        if let Some(resource) = resource
+            && let Some(obj) = resource_spans[i].as_object_mut()
+        {
+            obj.insert("resource".into(), resource);
+        }
+
         if prune_rs {
             resource_spans.remove(i);
         } else {
@@ -119,6 +140,7 @@ pub(super) async fn evaluate_traces_envelope(
         }
     }
 
+    drops.emit();
     !resource_spans.is_empty()
 }
 
@@ -304,4 +326,224 @@ fn merge_ot_tracestate(tracestate: &str, sub_kv: &str) -> String {
         result.push_str(&other_vendors.join(","));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn val(value: serde_json::Value) -> Value {
+        Value::from(value)
+    }
+
+    /// Build a read-only adapter over an owned span value.
+    fn get(span: serde_json::Value, sel: TraceFieldSelector) -> Option<String> {
+        let mut span = val(span);
+        let adapter = TraceAdapter {
+            span: &mut span,
+            resource: None,
+            scope: None,
+            resource_schema_url: None,
+            scope_schema_url: None,
+        };
+        adapter.get_field(&sel).map(Cow::into_owned)
+    }
+
+    fn exists(span: serde_json::Value, sel: &TraceFieldSelector) -> bool {
+        let mut span = val(span);
+        let adapter = TraceAdapter {
+            span: &mut span,
+            resource: None,
+            scope: None,
+            resource_schema_url: None,
+            scope_schema_url: None,
+        };
+        adapter.field_exists(sel)
+    }
+
+    #[test]
+    fn simple_span_fields() {
+        let span = json!({
+            "name": "GET /x", "traceId": "abc", "spanId": "def",
+            "parentSpanId": "p", "traceState": "ot=th:8", "kind": "SPAN_KIND_SERVER"
+        });
+        assert_eq!(
+            get(span.clone(), TraceFieldSelector::Simple(TraceField::Name)),
+            Some("GET /x".to_string()),
+        );
+        assert_eq!(
+            get(span.clone(), TraceFieldSelector::Simple(TraceField::TraceId)),
+            Some("abc".to_string()),
+        );
+        assert_eq!(
+            get(span.clone(), TraceFieldSelector::Simple(TraceField::SpanId)),
+            Some("def".to_string()),
+        );
+        assert_eq!(
+            get(
+                span.clone(),
+                TraceFieldSelector::Simple(TraceField::ParentSpanId)
+            ),
+            Some("p".to_string()),
+        );
+        assert_eq!(
+            get(
+                span.clone(),
+                TraceFieldSelector::Simple(TraceField::TraceState)
+            ),
+            Some("ot=th:8".to_string()),
+        );
+        assert_eq!(
+            get(span, TraceFieldSelector::SpanKind),
+            Some("SPAN_KIND_SERVER".to_string()),
+        );
+    }
+
+    #[test]
+    fn span_status_maps_to_policy_codes() {
+        assert_eq!(
+            get(
+                json!({"status": {"code": "STATUS_CODE_OK"}}),
+                TraceFieldSelector::SpanStatus
+            ),
+            Some("SPAN_STATUS_CODE_OK".to_string()),
+        );
+        assert_eq!(
+            get(
+                json!({"status": {"code": "STATUS_CODE_ERROR"}}),
+                TraceFieldSelector::SpanStatus
+            ),
+            Some("SPAN_STATUS_CODE_ERROR".to_string()),
+        );
+        assert_eq!(
+            get(
+                json!({"status": {"code": "STATUS_CODE_UNSET"}}),
+                TraceFieldSelector::SpanStatus
+            ),
+            Some("SPAN_STATUS_CODE_UNSPECIFIED".to_string()),
+        );
+    }
+
+    #[test]
+    fn empty_status_is_unset_not_absent() {
+        // Regression guard: proto3 omits the default STATUS_CODE_UNSET, so a
+        // present-but-empty `status` must resolve to UNSPECIFIED and `exists`.
+        assert_eq!(
+            get(json!({"status": {}}), TraceFieldSelector::SpanStatus),
+            Some("SPAN_STATUS_CODE_UNSPECIFIED".to_string()),
+        );
+        assert!(exists(json!({"status": {}}), &TraceFieldSelector::SpanStatus));
+    }
+
+    #[test]
+    fn absent_status_is_none() {
+        assert_eq!(
+            get(json!({"name": "x"}), TraceFieldSelector::SpanStatus),
+            None,
+        );
+        assert!(!exists(
+            json!({"name": "x"}),
+            &TraceFieldSelector::SpanStatus
+        ));
+    }
+
+    #[test]
+    fn event_name_is_first_non_empty() {
+        assert_eq!(
+            get(
+                json!({"events": [{"name": ""}, {"name": "exception"}, {"name": "other"}]}),
+                TraceFieldSelector::EventName,
+            ),
+            Some("exception".to_string()),
+        );
+        assert_eq!(
+            get(json!({"events": []}), TraceFieldSelector::EventName),
+            None,
+        );
+    }
+
+    #[test]
+    fn span_resource_scope_attributes() {
+        let mut span =
+            val(json!({"attributes": [{"key": "http.method", "value": {"stringValue": "GET"}}]}));
+        let resource =
+            val(json!({"attributes": [{"key": "service.name", "value": {"stringValue": "api"}}]}));
+        let scope = val(json!({"attributes": [{"key": "lib", "value": {"stringValue": "x"}}]}));
+        let adapter = TraceAdapter {
+            span: &mut span,
+            resource: Some(&resource),
+            scope: Some(&scope),
+            resource_schema_url: None,
+            scope_schema_url: None,
+        };
+        let g = |sel| adapter.get_field(&sel).map(Cow::into_owned);
+        assert_eq!(
+            g(TraceFieldSelector::SpanAttribute(vec![
+                "http.method".to_string()
+            ])),
+            Some("GET".to_string()),
+        );
+        assert_eq!(
+            g(TraceFieldSelector::ResourceAttribute(vec![
+                "service.name".to_string()
+            ])),
+            Some("api".to_string()),
+        );
+        assert_eq!(
+            g(TraceFieldSelector::ScopeAttribute(vec!["lib".to_string()])),
+            Some("x".to_string()),
+        );
+    }
+
+    #[test]
+    fn sampling_threshold_writes_tracestate() {
+        let mut span = val(json!({"name": "x"}));
+        {
+            let mut adapter = TraceAdapter {
+                span: &mut span,
+                resource: None,
+                scope: None,
+                resource_schema_url: None,
+                scope_schema_url: None,
+            };
+            adapter.set_field(&TraceFieldSelector::SamplingThreshold, "0");
+        }
+        assert_eq!(
+            span.get("traceState").and_then(|v| v.as_str()).as_deref(),
+            Some("ot=th:0"),
+        );
+    }
+
+    #[test]
+    fn sampling_threshold_merges_existing_tracestate() {
+        let mut span = val(json!({"traceState": "ot=rv:abc,vendor=1"}));
+        {
+            let mut adapter = TraceAdapter {
+                span: &mut span,
+                resource: None,
+                scope: None,
+                resource_schema_url: None,
+                scope_schema_url: None,
+            };
+            adapter.set_field(&TraceFieldSelector::SamplingThreshold, "8");
+        }
+        let ts = span
+            .get("traceState")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .into_owned();
+        assert!(ts.contains("rv:abc"), "rv preserved: {ts}");
+        assert!(ts.contains("th:8"), "th written: {ts}");
+        assert!(ts.contains("vendor=1"), "other vendor preserved: {ts}");
+    }
+
+    #[test]
+    fn merge_ot_tracestate_cases() {
+        assert_eq!(merge_ot_tracestate("", "th:8"), "ot=th:8");
+        assert_eq!(merge_ot_tracestate("ot=rv:abc", "th:8"), "ot=rv:abc;th:8");
+        assert_eq!(merge_ot_tracestate("foo=bar", "th:8"), "ot=th:8,foo=bar");
+        // An existing `th` is overwritten, not duplicated.
+        assert_eq!(merge_ot_tracestate("ot=th:4", "th:8"), "ot=th:8");
+    }
 }

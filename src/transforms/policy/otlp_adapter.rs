@@ -38,7 +38,7 @@ use policy_rs::{
 };
 use vector_lib::event::{LogEvent, ObjectMap, Value};
 
-use super::internal_events::{DropReason, emit_dropped};
+use super::internal_events::{DropCounts, DropReason};
 
 /// Iterate every record inside an OTLP envelope event, applying policies
 /// per-record. Returns `Some(log)` to forward (with mutated and possibly
@@ -59,6 +59,7 @@ pub(super) async fn evaluate_envelope(
         return Some(log);
     };
 
+    let mut drops = DropCounts::default();
     let mut i = 0;
     while i < resource_logs.len() {
         // Lift `resource` out of the entry so the adapter can hold a mutable
@@ -112,15 +113,15 @@ pub(super) async fn evaluate_envelope(
                             }
                             Ok(EvaluateResult::Drop { .. }) => {
                                 records.remove(k);
-                                emit_dropped(DropReason::PolicyDrop);
+                                drops.record(DropReason::PolicyDrop);
                             }
                             Ok(EvaluateResult::Sample { keep: false, .. }) => {
                                 records.remove(k);
-                                emit_dropped(DropReason::SampleRejected);
+                                drops.record(DropReason::SampleRejected);
                             }
                             Ok(EvaluateResult::RateLimit { allowed: false, .. }) => {
                                 records.remove(k);
-                                emit_dropped(DropReason::RateLimited);
+                                drops.record(DropReason::RateLimited);
                             }
                             Err(error) => {
                                 error!(
@@ -163,6 +164,8 @@ pub(super) async fn evaluate_envelope(
             i += 1;
         }
     }
+
+    drops.emit();
 
     if resource_logs.is_empty() {
         None
@@ -470,7 +473,7 @@ pub(super) fn find_attribute_path<'a>(
 fn find_in_kvlist<'a>(attrs: &'a [Value], path: &[String]) -> Option<Cow<'a, str>> {
     let first = path.first()?;
     for kv in attrs {
-        if attribute_key(kv) != Some(first.as_str()) {
+        if !attribute_key_eq(kv, first) {
             continue;
         }
         let value = kv.as_object().and_then(|o| o.get("value"));
@@ -494,7 +497,7 @@ fn exists_in_kvlist(attrs: &[Value], path: &[String]) -> bool {
         return false;
     };
     for kv in attrs {
-        if attribute_key(kv) != Some(first.as_str()) {
+        if !attribute_key_eq(kv, first) {
             continue;
         }
         let value = kv.as_object().and_then(|o| o.get("value"));
@@ -518,13 +521,14 @@ fn nested_values(value: Option<&Value>) -> Option<&[Value]> {
         .and_then(Value::as_array)
 }
 
-fn attribute_key(item: &Value) -> Option<&str> {
-    item.as_object()
-        .and_then(|o| o.get("key"))
-        .and_then(|v| match v {
-            Value::Bytes(b) => std::str::from_utf8(b).ok(),
-            _ => None,
-        })
+/// Whether an attribute entry's `key` equals `key`, comparing raw bytes so we
+/// skip UTF-8 validation on every entry of a linear scan (the key is an OTLP
+/// `string`, but for an equality test the byte representation is sufficient).
+fn attribute_key_eq(item: &Value, key: &str) -> bool {
+    matches!(
+        item.as_object().and_then(|o| o.get("key")),
+        Some(Value::Bytes(b)) if b.as_ref() == key.as_bytes()
+    )
 }
 
 // =============================================================================
@@ -536,10 +540,7 @@ fn set_string_attr(attrs: &mut Vec<Value>, path: &[String], value: &str) {
     let Some(key) = path.first() else {
         return;
     };
-    if let Some(entry) = attrs
-        .iter_mut()
-        .find(|kv| attribute_key(kv) == Some(key.as_str()))
-    {
+    if let Some(entry) = attrs.iter_mut().find(|kv| attribute_key_eq(kv, key)) {
         if let Some(obj) = entry.as_object_mut() {
             obj.insert("value".into(), make_string_any_value(value));
         }
@@ -554,22 +555,20 @@ fn remove_attr(attrs: &mut Vec<Value>, path: &[String]) -> bool {
         return false;
     };
     let before = attrs.len();
-    attrs.retain(|kv| attribute_key(kv) != Some(key.as_str()));
+    attrs.retain(|kv| !attribute_key_eq(kv, key));
     attrs.len() < before
 }
 
 /// Remove and return the first-segment attribute entry, preserving its value.
 fn remove_attr_kv(attrs: &mut Vec<Value>, path: &[String]) -> Option<Value> {
     let key = path.first()?;
-    let idx = attrs
-        .iter()
-        .position(|kv| attribute_key(kv) == Some(key.as_str()))?;
+    let idx = attrs.iter().position(|kv| attribute_key_eq(kv, key))?;
     Some(attrs.remove(idx))
 }
 
 /// Insert an entry under `key`, removing any existing entry with that key first.
 fn upsert_entry(attrs: &mut Vec<Value>, key: &str, entry: Value) {
-    attrs.retain(|kv| attribute_key(kv) != Some(key));
+    attrs.retain(|kv| !attribute_key_eq(kv, key));
     attrs.push(entry);
 }
 

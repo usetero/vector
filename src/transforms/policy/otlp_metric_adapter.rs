@@ -46,73 +46,93 @@ pub(super) async fn evaluate_metrics_envelope(
         return Some(log);
     };
 
+    let mut dropped = 0u64;
     let mut i = 0;
     while i < resource_metrics.len() {
-        // Metrics are read-only, so immutable snapshots of resource/scope are
-        // enough (no remove/re-insert dance needed).
-        let resource = resource_metrics[i].get("resource").cloned();
-        let resource_schema_url = resource_metrics[i].get("schemaUrl").cloned();
+        // Phase 1 — score every metric. Metric evaluation is filter-only (no
+        // transform), so resource/scope/metric are all read-only here: we can
+        // borrow them immutably and avoid both the deep clone and the
+        // remove/re-insert lift the log/trace paths need. `keep[s][m]` is
+        // whether scope `s`'s metric `m` survives.
+        let keep: Vec<Vec<bool>> = {
+            let rm = &resource_metrics[i];
+            let resource = rm.get("resource");
+            let resource_schema_url = rm.get("schemaUrl");
+            let mut per_scope = Vec::new();
+            if let Some(scope_metrics) = rm.get("scopeMetrics").and_then(Value::as_array) {
+                for sm in scope_metrics {
+                    let scope = sm.get("scope");
+                    let scope_schema_url = sm.get("schemaUrl");
+                    let mut per_metric = Vec::new();
+                    if let Some(metrics) = sm.get("metrics").and_then(Value::as_array) {
+                        for metric in metrics {
+                            let adapter = MetricAdapter {
+                                metric,
+                                resource,
+                                scope,
+                                resource_schema_url,
+                                scope_schema_url,
+                            };
+                            let drop = matches!(
+                                engine.evaluate(snapshot, &adapter).await,
+                                Ok(EvaluateResult::Drop { .. })
+                            );
+                            if drop {
+                                dropped += 1;
+                            }
+                            per_metric.push(!drop);
+                        }
+                    }
+                    per_scope.push(per_metric);
+                }
+            }
+            per_scope
+        };
 
-        let mut prune_rm = false;
-
+        // Phase 2 — apply the decisions, then prune emptied scopes / resource.
         if let Some(scope_metrics) = resource_metrics[i]
             .get_mut("scopeMetrics")
             .and_then(Value::as_array_mut)
         {
+            // `scope_idx` indexes `keep` by original scope position; `j` tracks
+            // the live position as emptied scopes are removed.
+            let mut scope_idx = 0;
             let mut j = 0;
             while j < scope_metrics.len() {
-                let scope = scope_metrics[j].get("scope").cloned();
-                let scope_schema_url = scope_metrics[j].get("schemaUrl").cloned();
-
-                let mut prune_sm = false;
-
+                let scope_keep = &keep[scope_idx];
+                scope_idx += 1;
                 if let Some(metrics) = scope_metrics[j]
                     .get_mut("metrics")
                     .and_then(Value::as_array_mut)
                 {
-                    // Evaluate first (immutable borrows), then retain by index.
-                    let mut keep = Vec::with_capacity(metrics.len());
-                    for metric in metrics.iter() {
-                        let adapter = MetricAdapter {
-                            metric,
-                            resource: resource.as_ref(),
-                            scope: scope.as_ref(),
-                            resource_schema_url: resource_schema_url.as_ref(),
-                            scope_schema_url: scope_schema_url.as_ref(),
-                        };
-                        let drop = matches!(
-                            engine.evaluate(snapshot, &adapter).await,
-                            Ok(EvaluateResult::Drop { .. })
-                        );
-                        if drop {
-                            emit_dropped(DropReason::PolicyDrop);
-                        }
-                        keep.push(!drop);
-                    }
-                    let mut idx = 0;
+                    let mut m = 0;
                     metrics.retain(|_| {
-                        let k = keep[idx];
-                        idx += 1;
+                        let k = scope_keep[m];
+                        m += 1;
                         k
                     });
-                    prune_sm = metrics.is_empty();
+                    if metrics.is_empty() {
+                        scope_metrics.remove(j);
+                        continue;
+                    }
                 }
-
-                if prune_sm {
-                    scope_metrics.remove(j);
-                } else {
-                    j += 1;
-                }
+                j += 1;
             }
-            prune_rm = scope_metrics.is_empty();
         }
 
+        let prune_rm = resource_metrics[i]
+            .get("scopeMetrics")
+            .and_then(Value::as_array)
+            .map(<[Value]>::is_empty)
+            .unwrap_or(true);
         if prune_rm {
             resource_metrics.remove(i);
         } else {
             i += 1;
         }
     }
+
+    emit_dropped(DropReason::PolicyDrop, dropped);
 
     if resource_metrics.is_empty() {
         None
@@ -213,5 +233,156 @@ impl Matchable for MetricAdapter<'_> {
             }
             _ => self.get_field(field).is_some(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn val(value: serde_json::Value) -> Value {
+        Value::from(value)
+    }
+
+    fn adapter<'a>(
+        metric: &'a Value,
+        resource: Option<&'a Value>,
+        scope: Option<&'a Value>,
+    ) -> MetricAdapter<'a> {
+        MetricAdapter {
+            metric,
+            resource,
+            scope,
+            resource_schema_url: None,
+            scope_schema_url: None,
+        }
+    }
+
+    fn get(metric: &Value, sel: MetricFieldSelector) -> Option<String> {
+        adapter(metric, None, None)
+            .get_field(&sel)
+            .map(Cow::into_owned)
+    }
+
+    #[test]
+    fn metric_type_derived_from_data_variant() {
+        let cases = [
+            (json!({"name": "m", "gauge": {"dataPoints": []}}), "METRIC_TYPE_GAUGE"),
+            (json!({"name": "m", "sum": {"dataPoints": []}}), "METRIC_TYPE_SUM"),
+            (
+                json!({"name": "m", "histogram": {"dataPoints": []}}),
+                "METRIC_TYPE_HISTOGRAM",
+            ),
+            (
+                json!({"name": "m", "exponentialHistogram": {"dataPoints": []}}),
+                "METRIC_TYPE_EXPONENTIAL_HISTOGRAM",
+            ),
+            (
+                json!({"name": "m", "summary": {"dataPoints": []}}),
+                "METRIC_TYPE_SUMMARY",
+            ),
+        ];
+        for (metric, expected) in cases {
+            let metric = val(metric);
+            assert_eq!(
+                get(&metric, MetricFieldSelector::Type),
+                Some(expected.to_string()),
+            );
+        }
+    }
+
+    #[test]
+    fn temporality_read_from_data_variant() {
+        let delta = val(json!({
+            "name": "m",
+            "sum": {"dataPoints": [], "aggregationTemporality": "AGGREGATION_TEMPORALITY_DELTA"}
+        }));
+        assert_eq!(
+            get(&delta, MetricFieldSelector::Temporality),
+            Some("AGGREGATION_TEMPORALITY_DELTA".to_string()),
+        );
+
+        // Gauge has no temporality.
+        let gauge = val(json!({"name": "m", "gauge": {"dataPoints": []}}));
+        assert_eq!(get(&gauge, MetricFieldSelector::Temporality), None);
+    }
+
+    #[test]
+    fn descriptor_fields() {
+        let m = val(json!({
+            "name": "http.requests", "description": "count", "unit": "1",
+            "gauge": {"dataPoints": []}
+        }));
+        assert_eq!(
+            get(&m, MetricFieldSelector::Simple(MetricField::Name)),
+            Some("http.requests".to_string()),
+        );
+        assert_eq!(
+            get(&m, MetricFieldSelector::Simple(MetricField::Description)),
+            Some("count".to_string()),
+        );
+        assert_eq!(
+            get(&m, MetricFieldSelector::Simple(MetricField::Unit)),
+            Some("1".to_string()),
+        );
+    }
+
+    #[test]
+    fn datapoint_attribute_uses_first_datapoint() {
+        let m = val(json!({"name": "m", "sum": {"dataPoints": [
+            {"attributes": [{"key": "http.method", "value": {"stringValue": "GET"}}]},
+            {"attributes": [{"key": "http.method", "value": {"stringValue": "POST"}}]}
+        ]}}));
+        assert_eq!(
+            get(
+                &m,
+                MetricFieldSelector::DatapointAttribute(vec!["http.method".to_string()])
+            ),
+            Some("GET".to_string()),
+        );
+    }
+
+    #[test]
+    fn non_string_datapoint_attr_exists_but_is_unmatchable() {
+        let m = val(json!({"name": "m", "sum": {"dataPoints": [
+            {"attributes": [{"key": "count", "value": {"intValue": "42"}}]}
+        ]}}));
+        let sel = MetricFieldSelector::DatapointAttribute(vec!["count".to_string()]);
+        // Not coercible to a string for matching...
+        assert_eq!(get(&m, sel.clone()), None);
+        // ...but `exists` still fires.
+        assert!(adapter(&m, None, None).field_exists(&sel));
+    }
+
+    #[test]
+    fn resource_and_scope_fields() {
+        let m = val(json!({"name": "m", "gauge": {"dataPoints": []}}));
+        let resource =
+            val(json!({"attributes": [{"key": "service.name", "value": {"stringValue": "api"}}]}));
+        let scope = val(json!({
+            "name": "lib", "version": "1.2",
+            "attributes": [{"key": "k", "value": {"stringValue": "x"}}]
+        }));
+        let adapter = adapter(&m, Some(&resource), Some(&scope));
+        let g = |sel| adapter.get_field(&sel).map(Cow::into_owned);
+        assert_eq!(
+            g(MetricFieldSelector::ResourceAttribute(vec![
+                "service.name".to_string()
+            ])),
+            Some("api".to_string()),
+        );
+        assert_eq!(
+            g(MetricFieldSelector::ScopeAttribute(vec!["k".to_string()])),
+            Some("x".to_string()),
+        );
+        assert_eq!(
+            g(MetricFieldSelector::Simple(MetricField::ScopeName)),
+            Some("lib".to_string()),
+        );
+        assert_eq!(
+            g(MetricFieldSelector::Simple(MetricField::ScopeVersion)),
+            Some("1.2".to_string()),
+        );
     }
 }

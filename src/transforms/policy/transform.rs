@@ -129,15 +129,15 @@ async fn evaluate_flat(
         | Ok(EvaluateResult::Sample { keep: true, .. })
         | Ok(EvaluateResult::RateLimit { allowed: true, .. }) => Some(log),
         Ok(EvaluateResult::Drop { .. }) => {
-            emit_dropped(DropReason::PolicyDrop);
+            emit_dropped(DropReason::PolicyDrop, 1);
             None
         }
         Ok(EvaluateResult::Sample { keep: false, .. }) => {
-            emit_dropped(DropReason::SampleRejected);
+            emit_dropped(DropReason::SampleRejected, 1);
             None
         }
         Ok(EvaluateResult::RateLimit { allowed: false, .. }) => {
-            emit_dropped(DropReason::RateLimited);
+            emit_dropped(DropReason::RateLimited, 1);
             None
         }
         Err(error) => {

@@ -28,9 +28,43 @@ impl DropReason {
     }
 }
 
-pub(crate) fn emit_dropped(reason: DropReason) {
+/// Per-envelope accumulator for dropped-record counts.
+///
+/// OTLP envelopes can drop many records in a single event; emitting one
+/// `ComponentEventsDropped` per record would hammer the metrics path. Instead
+/// callers `record` each drop and `emit` once per envelope, collapsing N
+/// `emit!` calls into at most one per reason.
+#[derive(Default)]
+pub(crate) struct DropCounts {
+    policy_drop: u64,
+    sample_rejected: u64,
+    rate_limited: u64,
+}
+
+impl DropCounts {
+    pub(crate) fn record(&mut self, reason: DropReason) {
+        match reason {
+            DropReason::PolicyDrop => self.policy_drop += 1,
+            DropReason::SampleRejected => self.sample_rejected += 1,
+            DropReason::RateLimited => self.rate_limited += 1,
+        }
+    }
+
+    pub(crate) fn emit(&self) {
+        emit_dropped(DropReason::PolicyDrop, self.policy_drop);
+        emit_dropped(DropReason::SampleRejected, self.sample_rejected);
+        emit_dropped(DropReason::RateLimited, self.rate_limited);
+    }
+}
+
+/// Emit a single aggregated `ComponentEventsDropped` for `count` records. A
+/// zero count emits nothing.
+pub(crate) fn emit_dropped(reason: DropReason, count: u64) {
+    if count == 0 {
+        return;
+    }
     emit!(ComponentEventsDropped::<INTENTIONAL> {
-        count: 1,
+        count: count as usize,
         reason: reason.as_str(),
     });
 }

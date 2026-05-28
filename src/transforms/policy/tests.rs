@@ -14,7 +14,7 @@ use tempfile::NamedTempFile;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use vector_lib::config::LogNamespace;
-use vector_lib::event::{LogEvent, Metric, MetricKind, MetricValue};
+use vector_lib::event::{LogEvent, Metric, MetricKind, MetricValue, TraceEvent};
 
 use crate::event::{Event, Value};
 use crate::test_util::components::init_test;
@@ -1952,6 +1952,232 @@ async fn otel_mode_metric_event_passes_through_untouched() {
     tx.send(metric).await.unwrap();
     let received = recv(&mut out).await.expect("metric passes through");
     assert!(matches!(received, Event::Metric(_)));
+
+    drop(tx);
+    topology.stop().await;
+}
+
+// =============================================================================
+// OTel mode: OTLP metrics envelopes (`resourceMetrics`).
+// =============================================================================
+
+const OTEL_POLICY_DROP_METRIC_BY_NAME: &str = r#"{
+  "policies": [
+    {
+      "id": "drop-system-load",
+      "name": "drop-system-load",
+      "metric": {
+        "match": [ { "metric_field": "name", "regex": "^system\\.load.*$" } ],
+        "keep": false
+      }
+    }
+  ]
+}"#;
+
+#[tokio::test]
+async fn otel_mode_metrics_envelope_drops_and_prunes() {
+    let policies = write_policies(OTEL_POLICY_DROP_METRIC_BY_NAME);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    // scope-a holds only a system.load metric (dropped → scope pruned);
+    // scope-b holds system.load (dropped) + http.requests (kept). This
+    // exercises the two-phase keep/prune index bookkeeping across scopes.
+    let envelope = Event::from_json_value(
+        json!({
+            "resourceMetrics": [{
+                "resource": { "attributes": [] },
+                "scopeMetrics": [
+                    {
+                        "scope": { "name": "scope-a" },
+                        "metrics": [
+                            { "name": "system.load.1", "gauge": { "dataPoints": [{ "attributes": [] }] } }
+                        ]
+                    },
+                    {
+                        "scope": { "name": "scope-b" },
+                        "metrics": [
+                            { "name": "system.load.5", "gauge": { "dataPoints": [{ "attributes": [] }] } },
+                            { "name": "http.requests", "sum": { "dataPoints": [{ "attributes": [] }], "aggregationTemporality": "AGGREGATION_TEMPORALITY_DELTA" } }
+                        ]
+                    }
+                ]
+            }]
+        }),
+        LogNamespace::Legacy,
+    )
+    .unwrap();
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("metrics envelope forwarded");
+    let log = received.into_log();
+
+    let scope_metrics = log
+        .get("resourceMetrics")
+        .and_then(|v| v.as_array())
+        .and_then(|rm| rm.first())
+        .and_then(|rm| rm.get("scopeMetrics"))
+        .and_then(|v| v.as_array())
+        .expect("scopeMetrics present");
+    assert_eq!(scope_metrics.len(), 1, "empty scope-a must be pruned");
+    assert_eq!(
+        scope_metrics[0]
+            .get("scope")
+            .and_then(|s| s.get("name"))
+            .and_then(|n| n.as_str())
+            .as_deref(),
+        Some("scope-b"),
+    );
+    let metrics = scope_metrics[0]
+        .get("metrics")
+        .and_then(|v| v.as_array())
+        .expect("metrics present");
+    assert_eq!(metrics.len(), 1, "only the non-matching metric survives");
+    assert_eq!(
+        metrics[0].get("name").and_then(|n| n.as_str()).as_deref(),
+        Some("http.requests"),
+    );
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_metrics_envelope_all_dropped_drops_event() {
+    let policies = write_policies(OTEL_POLICY_DROP_METRIC_BY_NAME);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = Event::from_json_value(
+        json!({
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "metrics": [
+                        { "name": "system.load.1", "gauge": { "dataPoints": [{ "attributes": [] }] } }
+                    ]
+                }]
+            }]
+        }),
+        LogNamespace::Legacy,
+    )
+    .unwrap();
+    tx.send(envelope).await.unwrap();
+
+    // The only metric is dropped, so the whole envelope is pruned away.
+    assert_no_event(&mut out).await;
+
+    drop(tx);
+    topology.stop().await;
+}
+
+// =============================================================================
+// OTel mode: OTLP traces envelopes (`resourceSpans`).
+// =============================================================================
+
+const OTEL_POLICY_DROP_TRACE_BY_NAME: &str = r#"{
+  "policies": [
+    {
+      "id": "drop-basic",
+      "name": "drop-basic",
+      "trace": {
+        "match": [ { "trace_field": "TRACE_FIELD_NAME", "exact": "basic" } ],
+        "keep": { "percentage": 0.0 }
+      }
+    }
+  ]
+}"#;
+
+const OTEL_POLICY_KEEP_ERROR_SPANS: &str = r#"{
+  "policies": [
+    {
+      "id": "keep-error",
+      "name": "keep-error",
+      "trace": {
+        "match": [ { "span_status": "SPAN_STATUS_CODE_ERROR", "exists": true } ],
+        "keep": { "percentage": 100.0 }
+      }
+    }
+  ]
+}"#;
+
+fn otlp_trace(value: serde_json::Value) -> Event {
+    Event::Trace(TraceEvent::from(Value::from(value)))
+}
+
+#[tokio::test]
+async fn otel_mode_traces_envelope_drops_and_prunes() {
+    let policies = write_policies(OTEL_POLICY_DROP_TRACE_BY_NAME);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = otlp_trace(json!({
+        "resourceSpans": [{
+            "resource": { "attributes": [] },
+            "scopeSpans": [{
+                "scope": { "name": "s" },
+                "spans": [
+                    { "name": "basic", "spanId": "a", "traceId": "t" },
+                    { "name": "keep-me", "spanId": "b", "traceId": "t" }
+                ]
+            }]
+        }]
+    }));
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("traces envelope forwarded");
+    let spans = received
+        .as_trace()
+        .get("resourceSpans")
+        .and_then(|v| v.as_array())
+        .and_then(|rs| rs.first())
+        .and_then(|rs| rs.get("scopeSpans"))
+        .and_then(|v| v.as_array())
+        .and_then(|ss| ss.first())
+        .and_then(|ss| ss.get("spans"))
+        .and_then(|v| v.as_array())
+        .expect("spans present");
+    assert_eq!(spans.len(), 1, "the matching span is dropped");
+    assert_eq!(
+        spans[0].get("name").and_then(|n| n.as_str()).as_deref(),
+        Some("keep-me"),
+    );
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_traces_sampling_writes_tracestate() {
+    let policies = write_policies(OTEL_POLICY_KEEP_ERROR_SPANS);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    let envelope = otlp_trace(json!({
+        "resourceSpans": [{
+            "scopeSpans": [{
+                "spans": [
+                    { "name": "checkout", "spanId": "a", "traceId": "t", "status": { "code": "STATUS_CODE_ERROR" } }
+                ]
+            }]
+        }]
+    }));
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("traces envelope forwarded");
+    let span = received
+        .as_trace()
+        .get("resourceSpans")
+        .and_then(|v| v.as_array())
+        .and_then(|rs| rs.first())
+        .and_then(|rs| rs.get("scopeSpans"))
+        .and_then(|v| v.as_array())
+        .and_then(|ss| ss.first())
+        .and_then(|ss| ss.get("spans"))
+        .and_then(|v| v.as_array())
+        .and_then(|s| s.first())
+        .cloned()
+        .expect("span kept");
+    // 100% sampling writes the OTel threshold `th=0` into the tracestate.
+    assert_eq!(
+        span.get("traceState").and_then(|v| v.as_str()).as_deref(),
+        Some("ot=th:0"),
+    );
 
     drop(tx);
     topology.stop().await;

@@ -16,7 +16,7 @@ use policy_rs::proto::tero::policy::v1::LogField;
 use policy_rs::{LogFieldSelector, Matchable, Transformable, engine::LogSignal};
 use vector_lib::{
     event::{LogEvent, Value},
-    lookup::{OwnedTargetPath, OwnedValuePath, lookup_v2::ConfigValuePath},
+    lookup::{OwnedValuePath, PathPrefix},
 };
 
 use super::field_mapping::FieldMapping;
@@ -32,93 +32,97 @@ impl<'a> VectorLogAdapter<'a> {
     pub const fn new(log: &'a mut LogEvent, mapping: &'a FieldMapping) -> Self {
         Self { log, mapping }
     }
+}
 
-    /// Resolve a `LogFieldSelector` to the corresponding `LogEvent` path.
-    ///
-    /// Returns `None` for selectors that the current mapping does not
-    /// represent — for example, the protobuf-default `LogField::Unspecified`
-    /// variant or fields that haven't been wired up yet. The engine treats
-    /// `None` as "field not present", which is the correct fail-soft
-    /// behaviour for matching.
-    fn path_for(&self, selector: &LogFieldSelector) -> Option<OwnedValuePath> {
-        match selector {
-            LogFieldSelector::Simple(field) => self.simple_path(*field),
-            LogFieldSelector::LogAttribute(path) => Some(FieldMapping::append_segments(
-                &self.mapping.log_attributes,
-                path,
-            )),
-            LogFieldSelector::ResourceAttribute(path) => Some(FieldMapping::append_segments(
-                &self.mapping.resource_attributes,
-                path,
-            )),
-            LogFieldSelector::ScopeAttribute(path) => Some(FieldMapping::append_segments(
-                &self.mapping.scope_attributes,
-                path,
-            )),
-        }
+/// Resolve a `LogFieldSelector` to the corresponding `LogEvent` value path.
+///
+/// Simple fields borrow the mapping's stored path (`Cow::Borrowed`, no
+/// allocation); only attribute selectors — which append dynamic segments —
+/// build a fresh path (`Cow::Owned`).
+///
+/// Returns `None` for selectors the mapping doesn't represent (e.g. the
+/// protobuf-default `LogField::Unspecified`); the engine treats `None` as
+/// "field not present", the correct fail-soft behaviour for matching.
+///
+/// Takes `&FieldMapping` rather than `&self` so callers can hold the resulting
+/// borrow of the mapping while mutating `self.log` (disjoint fields).
+fn value_path<'m>(
+    mapping: &'m FieldMapping,
+    selector: &LogFieldSelector,
+) -> Option<Cow<'m, OwnedValuePath>> {
+    match selector {
+        LogFieldSelector::Simple(field) => simple_value_path(mapping, *field).map(Cow::Borrowed),
+        LogFieldSelector::LogAttribute(path) => Some(Cow::Owned(FieldMapping::append_segments(
+            &mapping.log_attributes,
+            path,
+        ))),
+        LogFieldSelector::ResourceAttribute(path) => Some(Cow::Owned(
+            FieldMapping::append_segments(&mapping.resource_attributes, path),
+        )),
+        LogFieldSelector::ScopeAttribute(path) => Some(Cow::Owned(FieldMapping::append_segments(
+            &mapping.scope_attributes,
+            path,
+        ))),
     }
+}
 
-    fn simple_path(&self, field: LogField) -> Option<OwnedValuePath> {
-        let mapped: &ConfigValuePath = match field {
-            LogField::Body => &self.mapping.body,
-            LogField::SeverityText => &self.mapping.severity_text,
-            LogField::TraceId => &self.mapping.trace_id,
-            LogField::SpanId => &self.mapping.span_id,
-            LogField::EventName => &self.mapping.event_name,
-            LogField::ResourceSchemaUrl => &self.mapping.resource_schema_url,
-            LogField::ScopeSchemaUrl => &self.mapping.scope_schema_url,
-            LogField::Unspecified => return None,
-        };
-        Some(mapped.0.clone())
-    }
+fn simple_value_path(mapping: &FieldMapping, field: LogField) -> Option<&OwnedValuePath> {
+    Some(match field {
+        LogField::Body => &mapping.body.0,
+        LogField::SeverityText => &mapping.severity_text.0,
+        LogField::TraceId => &mapping.trace_id.0,
+        LogField::SpanId => &mapping.span_id.0,
+        LogField::EventName => &mapping.event_name.0,
+        LogField::ResourceSchemaUrl => &mapping.resource_schema_url.0,
+        LogField::ScopeSchemaUrl => &mapping.scope_schema_url.0,
+        LogField::Unspecified => return None,
+    })
 }
 
 impl Matchable for VectorLogAdapter<'_> {
     type Signal = LogSignal;
 
     fn get_field(&self, field: &LogFieldSelector) -> Option<Cow<'_, str>> {
-        let path = self.path_for(field)?;
-        let target = OwnedTargetPath::event(path);
-        let value = self.log.get(&target)?;
+        let path = value_path(self.mapping, field)?;
+        let value = self.log.get((PathPrefix::Event, path.as_ref()))?;
         value_to_match_string(value)
     }
 
     fn field_exists(&self, field: &LogFieldSelector) -> bool {
-        let Some(path) = self.path_for(field) else {
+        let Some(path) = value_path(self.mapping, field) else {
             return false;
         };
-        let target = OwnedTargetPath::event(path);
-        self.log.get(&target).is_some()
+        self.log.get((PathPrefix::Event, path.as_ref())).is_some()
     }
 }
 
 impl Transformable for VectorLogAdapter<'_> {
     fn set_field(&mut self, field: &LogFieldSelector, value: &str) {
-        if let Some(path) = self.path_for(field) {
-            let target = OwnedTargetPath::event(path);
-            self.log.insert(&target, value.to_string());
+        if let Some(path) = value_path(self.mapping, field) {
+            self.log
+                .insert((PathPrefix::Event, path.as_ref()), value.to_string());
         }
     }
 
     fn delete_field(&mut self, field: &LogFieldSelector) -> bool {
-        let Some(path) = self.path_for(field) else {
+        let Some(path) = value_path(self.mapping, field) else {
             return false;
         };
-        let target = OwnedTargetPath::event(path);
-        self.log.remove(&target).is_some()
+        self.log.remove((PathPrefix::Event, path.as_ref())).is_some()
     }
 
     fn move_field(&mut self, from: &LogFieldSelector, to: &LogFieldSelector) {
         // The engine guarantees `from` exists and `to` does not, so we can
         // remove from the source and unconditionally insert at the target
         // without losing data on a name collision.
-        let (Some(from_path), Some(to_path)) = (self.path_for(from), self.path_for(to)) else {
+        let (Some(from_path), Some(to_path)) =
+            (value_path(self.mapping, from), value_path(self.mapping, to))
+        else {
             return;
         };
-        let from_target = OwnedTargetPath::event(from_path);
-        let to_target = OwnedTargetPath::event(to_path);
-        if let Some(value) = self.log.remove(&from_target) {
-            self.log.insert(&to_target, value);
+        if let Some(value) = self.log.remove((PathPrefix::Event, from_path.as_ref())) {
+            self.log
+                .insert((PathPrefix::Event, to_path.as_ref()), value);
         }
     }
 }
@@ -150,6 +154,7 @@ mod tests {
     use chrono::Utc;
     use policy_rs::proto::tero::policy::v1::LogField;
     use vector_lib::event::LogEvent;
+    use vector_lib::lookup::OwnedTargetPath;
 
     fn make_log() -> LogEvent {
         let mut log = LogEvent::default();
