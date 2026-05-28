@@ -15,6 +15,8 @@ use super::config::PolicyMode;
 use super::field_mapping::FieldMapping;
 use super::internal_events::{DropReason, emit_dropped};
 use super::otlp_adapter::evaluate_envelope;
+use super::otlp_metric_adapter::evaluate_metrics_envelope;
+use super::otlp_trace_adapter::evaluate_traces_envelope;
 
 /// Per-task state for the `policy` transform.
 ///
@@ -60,15 +62,22 @@ impl TaskTransform<Event> for Policy {
 
         Box::pin(stream! {
             while let Some(event) = input_rx.next().await {
+                // Pull a fresh snapshot every event so live-reloaded policies
+                // take effect on the next pass. Snapshots are cheap (Arc clone
+                // of an immutable inner).
+                let snapshot = registry.snapshot();
                 match event {
                     Event::Log(log) => {
-                        // Pull a fresh snapshot every event so live-reloaded
-                        // policies take effect on the next pass. Snapshots
-                        // are cheap (Arc clone of an immutable inner).
-                        let snapshot = registry.snapshot();
                         let outcome = match mode {
                             PolicyMode::Flat => {
                                 evaluate_flat(&engine, &snapshot, &mapping, log).await
+                            }
+                            // In OTel mode a `Log` event is either a logs
+                            // envelope (`resourceLogs`) or a metrics envelope
+                            // (`resourceMetrics`) — the `opentelemetry` source
+                            // decodes both into `Log` events.
+                            PolicyMode::Otel if log.contains("resourceMetrics") => {
+                                evaluate_metrics_envelope(&engine, &snapshot, log).await
                             }
                             PolicyMode::Otel => {
                                 evaluate_envelope(&engine, &snapshot, log).await
@@ -78,10 +87,22 @@ impl TaskTransform<Event> for Policy {
                             yield Event::Log(forwarded);
                         }
                     }
+                    Event::Trace(mut trace) => {
+                        // OTLP traces arrive as `Trace` events
+                        // (`resourceSpans`). Flat mode has no trace mapping, so
+                        // only OTel mode evaluates them; otherwise pass through.
+                        let keep = match mode {
+                            PolicyMode::Otel => {
+                                evaluate_traces_envelope(&engine, &snapshot, &mut trace).await
+                            }
+                            PolicyMode::Flat => true,
+                        };
+                        if keep {
+                            yield Event::Trace(trace);
+                        }
+                    }
+                    // Native Vector metrics (not OTLP envelopes) pass through.
                     other => {
-                        // policy-rs only targets the log signal in this
-                        // integration. Metrics and traces are forwarded
-                        // untouched regardless of mode.
                         yield other;
                     }
                 }

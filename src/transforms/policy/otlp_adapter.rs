@@ -7,23 +7,27 @@
 //! it through `policy-rs` via [`OtlpLogAdapter`], filters in place, and
 //! prunes empty `scopeLogs` / `resourceLogs` entries.
 //!
-//! Differences from [`super::adapter::VectorLogAdapter`]:
+//! The adapter mirrors the conformance reference adapter
+//! (`policy-conformance/runners/rs/src/eval.rs`) so behaviour matches the
+//! spec exactly:
 //!
 //! * Field names are camelCase per the proto3 JSON mapping
 //!   (`severityText`, not `severity_text`).
-//! * `body` is an OTLP `AnyValue`, so `body.stringValue` (and other
-//!   variants) is the real path to the value.
-//! * Attributes are always arrays of `{ key, value: AnyValue }` — not
-//!   key-value maps. Lookup is a linear scan by key.
-//! * Resource and scope are read-only in this mode: mutating cloned
-//!   siblings would not affect the underlying envelope, so
-//!   `set_field` / `delete_field` / `move_field` on
-//!   `ResourceAttribute` / `ScopeAttribute` selectors are no-ops. We
-//!   can lift this restriction later by restructuring the iteration if
-//!   real users need it.
-//! * Multi-segment `LogAttribute(["http", "method"])` paths are
-//!   dot-joined and looked up as the single OTel key `"http.method"`.
-//!   Walking `kvlistValue` for true nesting is a future extension.
+//! * `body` is an OTLP `AnyValue`; only a non-empty `stringValue` is
+//!   matchable. Non-string variants (`intValue`, `boolValue`, …) are not
+//!   coerced to strings for matching, so a regex redact targeting a string
+//!   never mutates them.
+//! * Simple string fields (`severityText`, `traceId`, `spanId`,
+//!   `eventName`, schema URLs) treat the empty string as absent.
+//! * `traceId` / `spanId` arrive already hex-encoded (the OTLP decoder
+//!   normalizes the raw `bytes` to canonical OTLP/JSON hex), so they are
+//!   plain strings here.
+//! * Attributes are arrays of `{ key, value: AnyValue }`. Multi-segment
+//!   selectors (`["http", "method"]`) walk nested `kvlistValue` entries.
+//! * Resource and scope attributes are mutable: the envelope iteration
+//!   lends the adapter `&mut` access to the parent `resource` / `scope`
+//!   objects, so add / redact / remove / rename on
+//!   `ResourceAttribute` / `ScopeAttribute` selectors mutate them in place.
 
 use std::borrow::Cow;
 
@@ -57,10 +61,13 @@ pub(super) async fn evaluate_envelope(
 
     let mut i = 0;
     while i < resource_logs.len() {
-        // Clone the resource sub-object and the resourceLogs entry's
-        // schemaUrl so the adapter can hold immutable refs to them without
-        // aliasing the mutable borrow we'll take of `scopeLogs` below.
-        let resource = resource_logs[i].get("resource").cloned();
+        // Lift `resource` out of the entry so the adapter can hold a mutable
+        // borrow of it alongside the mutable borrow of `scopeLogs` we take
+        // below (the borrow checker can't prove those paths are disjoint).
+        // It is re-inserted after all records under this resource are done.
+        let mut resource = resource_logs[i]
+            .as_object_mut()
+            .and_then(|o| o.remove("resource"));
         let resource_schema_url = resource_logs[i].get("schemaUrl").cloned();
 
         let mut prune_this_rl = false;
@@ -71,7 +78,10 @@ pub(super) async fn evaluate_envelope(
         {
             let mut j = 0;
             while j < scope_logs.len() {
-                let scope = scope_logs[j].get("scope").cloned();
+                // Same trick for `scope`.
+                let mut scope = scope_logs[j]
+                    .as_object_mut()
+                    .and_then(|o| o.remove("scope"));
                 let scope_schema_url = scope_logs[j].get("schemaUrl").cloned();
 
                 let mut prune_this_sl = false;
@@ -85,8 +95,8 @@ pub(super) async fn evaluate_envelope(
                         let result = {
                             let mut adapter = OtlpLogAdapter::new(
                                 &mut records[k],
-                                resource.as_ref(),
-                                scope.as_ref(),
+                                resource.as_mut(),
+                                scope.as_mut(),
                                 resource_schema_url.as_ref(),
                                 scope_schema_url.as_ref(),
                             );
@@ -124,6 +134,13 @@ pub(super) async fn evaluate_envelope(
                     prune_this_sl = records.is_empty();
                 }
 
+                // Re-attach the (possibly mutated) scope.
+                if let Some(scope) = scope
+                    && let Some(obj) = scope_logs[j].as_object_mut()
+                {
+                    obj.insert("scope".into(), scope);
+                }
+
                 if prune_this_sl {
                     scope_logs.remove(j);
                 } else {
@@ -131,6 +148,13 @@ pub(super) async fn evaluate_envelope(
                 }
             }
             prune_this_rl = scope_logs.is_empty();
+        }
+
+        // Re-attach the (possibly mutated) resource.
+        if let Some(resource) = resource
+            && let Some(obj) = resource_logs[i].as_object_mut()
+        {
+            obj.insert("resource".into(), resource);
         }
 
         if prune_this_rl {
@@ -151,17 +175,17 @@ pub(super) async fn evaluate_envelope(
 /// and scope) to the `policy-rs` engine.
 pub(super) struct OtlpLogAdapter<'a> {
     log_record: &'a mut Value,
-    resource: Option<&'a Value>,
-    scope: Option<&'a Value>,
+    resource: Option<&'a mut Value>,
+    scope: Option<&'a mut Value>,
     resource_schema_url: Option<&'a Value>,
     scope_schema_url: Option<&'a Value>,
 }
 
 impl<'a> OtlpLogAdapter<'a> {
-    pub(super) const fn new(
+    pub(super) fn new(
         log_record: &'a mut Value,
-        resource: Option<&'a Value>,
-        scope: Option<&'a Value>,
+        resource: Option<&'a mut Value>,
+        scope: Option<&'a mut Value>,
         resource_schema_url: Option<&'a Value>,
         scope_schema_url: Option<&'a Value>,
     ) -> Self {
@@ -174,31 +198,17 @@ impl<'a> OtlpLogAdapter<'a> {
         }
     }
 
-    /// Look up the value at a simple-field selector for reads. Returns the
-    /// `&Value` (still wrapped) so callers can choose between
-    /// stringification (for `get_field`) and presence-only checks (for
-    /// `field_exists`).
-    fn simple_value(&self, field: LogField) -> Option<&Value> {
-        match field {
-            LogField::Body => self.log_record.get("body"),
-            LogField::SeverityText => self.log_record.get("severityText"),
-            LogField::TraceId => self.log_record.get("traceId"),
-            LogField::SpanId => self.log_record.get("spanId"),
-            LogField::EventName => self.log_record.get("eventName"),
-            LogField::ResourceSchemaUrl => self.resource_schema_url,
-            LogField::ScopeSchemaUrl => self.scope_schema_url,
-            LogField::Unspecified => None,
-        }
-    }
-
-    /// Look up the attributes array for an attribute-namespace selector.
+    /// Borrow the attributes array for an attribute-namespace selector.
     fn attributes_for(&self, selector: &LogFieldSelector) -> Option<&Value> {
         match selector {
             LogFieldSelector::LogAttribute(_) => self.log_record.get("attributes"),
-            LogFieldSelector::ResourceAttribute(_) => {
-                self.resource.and_then(|r| r.get("attributes"))
+            LogFieldSelector::ResourceAttribute(_) => self
+                .resource
+                .as_deref()
+                .and_then(|r| r.get("attributes")),
+            LogFieldSelector::ScopeAttribute(_) => {
+                self.scope.as_deref().and_then(|s| s.get("attributes"))
             }
-            LogFieldSelector::ScopeAttribute(_) => self.scope.and_then(|s| s.get("attributes")),
             LogFieldSelector::Simple(_) => None,
         }
     }
@@ -210,30 +220,43 @@ impl Matchable for OtlpLogAdapter<'_> {
     fn get_field(&self, field: &LogFieldSelector) -> Option<Cow<'_, str>> {
         match field {
             LogFieldSelector::Simple(LogField::Body) => {
-                self.log_record.get("body").and_then(any_value_to_string)
+                any_value_string(self.log_record.get("body"))
             }
-            LogFieldSelector::Simple(simple) => {
-                self.simple_value(*simple).and_then(plain_value_to_string)
+            LogFieldSelector::Simple(LogField::SeverityText) => {
+                non_empty(self.log_record.get("severityText"))
             }
+            LogFieldSelector::Simple(LogField::TraceId) => {
+                non_empty(self.log_record.get("traceId"))
+            }
+            LogFieldSelector::Simple(LogField::SpanId) => non_empty(self.log_record.get("spanId")),
+            LogFieldSelector::Simple(LogField::EventName) => {
+                non_empty(self.log_record.get("eventName"))
+            }
+            LogFieldSelector::Simple(LogField::ResourceSchemaUrl) => {
+                non_empty(self.resource_schema_url)
+            }
+            LogFieldSelector::Simple(LogField::ScopeSchemaUrl) => non_empty(self.scope_schema_url),
+            LogFieldSelector::Simple(LogField::Unspecified) => None,
             LogFieldSelector::LogAttribute(path)
             | LogFieldSelector::ResourceAttribute(path)
             | LogFieldSelector::ScopeAttribute(path) => {
-                let attrs = self.attributes_for(field)?;
-                find_attribute_value(attrs, &join_path(path))
+                find_attribute_path(self.attributes_for(field), path)
             }
         }
     }
 
     fn field_exists(&self, field: &LogFieldSelector) -> bool {
         match field {
+            LogFieldSelector::Simple(LogField::Body) => {
+                log_body_present(self.log_record.get("body"))
+            }
             LogFieldSelector::Simple(LogField::Unspecified) => false,
-            LogFieldSelector::Simple(simple) => self.simple_value(*simple).is_some(),
+            LogFieldSelector::Simple(_) => self.get_field(field).is_some(),
             LogFieldSelector::LogAttribute(path)
             | LogFieldSelector::ResourceAttribute(path)
-            | LogFieldSelector::ScopeAttribute(path) => match self.attributes_for(field) {
-                Some(attrs) => attribute_exists(attrs, &join_path(path)),
-                None => false,
-            },
+            | LogFieldSelector::ScopeAttribute(path) => {
+                attribute_exists_path(self.attributes_for(field), path)
+            }
         }
     }
 }
@@ -242,7 +265,9 @@ impl Transformable for OtlpLogAdapter<'_> {
     fn set_field(&mut self, field: &LogFieldSelector, value: &str) {
         match field {
             LogFieldSelector::Simple(LogField::Body) => {
-                self.log_record.insert("body", make_string_any_value(value));
+                if let Some(obj) = self.log_record.as_object_mut() {
+                    obj.insert("body".into(), make_string_any_value(value));
+                }
             }
             LogFieldSelector::Simple(LogField::SeverityText) => {
                 insert_simple_string(self.log_record, "severityText", value);
@@ -256,162 +281,241 @@ impl Transformable for OtlpLogAdapter<'_> {
             LogFieldSelector::Simple(LogField::EventName) => {
                 insert_simple_string(self.log_record, "eventName", value);
             }
-            // Simple fields whose backing storage isn't on the log record
-            // itself (schema URLs live on the parent entries) are read-only
-            // for the same reason ResourceAttribute / ScopeAttribute are:
-            // we only hold immutable refs.
+            // Schema URLs / unspecified have no log-record-local storage.
             LogFieldSelector::Simple(_) => {}
             LogFieldSelector::LogAttribute(path) => {
-                let key = join_path(path);
-                ensure_attributes_array(self.log_record);
-                if let Some(attrs) = self
-                    .log_record
-                    .get_mut("attributes")
-                    .and_then(Value::as_array_mut)
-                {
-                    set_attribute(attrs, &key, value);
+                if let Some(attrs) = ensure_attributes(self.log_record) {
+                    set_string_attr(attrs, path, value);
                 }
             }
-            LogFieldSelector::ResourceAttribute(_) | LogFieldSelector::ScopeAttribute(_) => {
-                // Read-only in OTel mode; see module docstring.
+            LogFieldSelector::ResourceAttribute(path) => {
+                if let Some(resource) = self.resource.as_deref_mut()
+                    && let Some(attrs) = ensure_attributes(resource)
+                {
+                    set_string_attr(attrs, path, value);
+                }
+            }
+            LogFieldSelector::ScopeAttribute(path) => {
+                if let Some(scope) = self.scope.as_deref_mut()
+                    && let Some(attrs) = ensure_attributes(scope)
+                {
+                    set_string_attr(attrs, path, value);
+                }
             }
         }
     }
 
     fn delete_field(&mut self, field: &LogFieldSelector) -> bool {
         match field {
-            LogFieldSelector::Simple(LogField::Body) => self.log_record_remove("body"),
+            LogFieldSelector::Simple(LogField::Body) => remove_key(self.log_record, "body"),
             LogFieldSelector::Simple(LogField::SeverityText) => {
-                self.log_record_remove("severityText")
+                remove_key(self.log_record, "severityText")
             }
-            LogFieldSelector::Simple(LogField::TraceId) => self.log_record_remove("traceId"),
-            LogFieldSelector::Simple(LogField::SpanId) => self.log_record_remove("spanId"),
-            LogFieldSelector::Simple(LogField::EventName) => self.log_record_remove("eventName"),
+            LogFieldSelector::Simple(LogField::TraceId) => remove_key(self.log_record, "traceId"),
+            LogFieldSelector::Simple(LogField::SpanId) => remove_key(self.log_record, "spanId"),
+            LogFieldSelector::Simple(LogField::EventName) => {
+                remove_key(self.log_record, "eventName")
+            }
             LogFieldSelector::Simple(_) => false,
-            LogFieldSelector::LogAttribute(path) => {
-                let key = join_path(path);
-                self.log_record
-                    .get_mut("attributes")
-                    .and_then(Value::as_array_mut)
-                    .map(|attrs| remove_attribute(attrs, &key))
-                    .unwrap_or(false)
-            }
-            LogFieldSelector::ResourceAttribute(_) | LogFieldSelector::ScopeAttribute(_) => false,
+            LogFieldSelector::LogAttribute(path) => attributes_of_mut(self.log_record)
+                .map(|attrs| remove_attr(attrs, path))
+                .unwrap_or(false),
+            LogFieldSelector::ResourceAttribute(path) => self
+                .resource
+                .as_deref_mut()
+                .and_then(attributes_of_mut)
+                .map(|attrs| remove_attr(attrs, path))
+                .unwrap_or(false),
+            LogFieldSelector::ScopeAttribute(path) => self
+                .scope
+                .as_deref_mut()
+                .and_then(attributes_of_mut)
+                .map(|attrs| remove_attr(attrs, path))
+                .unwrap_or(false),
         }
     }
 
     fn move_field(&mut self, from: &LogFieldSelector, to: &LogFieldSelector) {
-        // The engine guarantees `from` exists and `to` does not. In OTel
-        // mode we only support moves within the log-record's own
-        // attributes array.
-        let (LogFieldSelector::LogAttribute(from_path), LogFieldSelector::LogAttribute(to_path)) =
-            (from, to)
-        else {
+        // The engine guarantees `from` exists. Remove the underlying
+        // `{key, value}` entry (preserving the OTel value type) and re-insert
+        // it under `to`'s key in `to`'s namespace, overwriting any existing
+        // entry there (upsert semantics, matching the reference adapter).
+        let source = match from {
+            LogFieldSelector::LogAttribute(path) => {
+                attributes_of_mut(self.log_record).and_then(|attrs| remove_attr_kv(attrs, path))
+            }
+            LogFieldSelector::ResourceAttribute(path) => self
+                .resource
+                .as_deref_mut()
+                .and_then(attributes_of_mut)
+                .and_then(|attrs| remove_attr_kv(attrs, path)),
+            LogFieldSelector::ScopeAttribute(path) => self
+                .scope
+                .as_deref_mut()
+                .and_then(attributes_of_mut)
+                .and_then(|attrs| remove_attr_kv(attrs, path)),
+            LogFieldSelector::Simple(_) => None,
+        };
+        let Some(mut entry) = source else {
             return;
         };
-        let from_key = join_path(from_path);
-        let to_key = join_path(to_path);
-        if let Some(attrs) = self
-            .log_record
-            .get_mut("attributes")
-            .and_then(Value::as_array_mut)
-            && let Some(idx) = attribute_index(attrs, &from_key)
-        {
-            let entry = attrs.remove(idx);
-            if let Some(value) = entry.as_object().and_then(|o| o.get("value")).cloned() {
-                attrs.push(make_attribute_entry(&to_key, value));
+
+        let target_key = match to {
+            LogFieldSelector::LogAttribute(path)
+            | LogFieldSelector::ResourceAttribute(path)
+            | LogFieldSelector::ScopeAttribute(path) => path.first().cloned(),
+            LogFieldSelector::Simple(_) => None,
+        };
+        let Some(key) = target_key else {
+            return;
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("key".into(), Value::from(key.clone()));
+        }
+
+        match to {
+            LogFieldSelector::LogAttribute(_) => {
+                if let Some(attrs) = ensure_attributes(self.log_record) {
+                    upsert_entry(attrs, &key, entry);
+                }
             }
-        }
-    }
-}
-
-impl OtlpLogAdapter<'_> {
-    fn log_record_remove(&mut self, key: &str) -> bool {
-        match self.log_record.as_object_mut() {
-            Some(obj) => obj.remove(key).is_some(),
-            None => false,
+            LogFieldSelector::ResourceAttribute(_) => {
+                if let Some(resource) = self.resource.as_deref_mut()
+                    && let Some(attrs) = ensure_attributes(resource)
+                {
+                    upsert_entry(attrs, &key, entry);
+                }
+            }
+            LogFieldSelector::ScopeAttribute(_) => {
+                if let Some(scope) = self.scope.as_deref_mut()
+                    && let Some(attrs) = ensure_attributes(scope)
+                {
+                    upsert_entry(attrs, &key, entry);
+                }
+            }
+            LogFieldSelector::Simple(_) => {}
         }
     }
 }
 
 // =============================================================================
-// Value-shape helpers.
+// AnyValue helpers.
 // =============================================================================
 
-/// Coerce an OTLP `AnyValue` object to a string for matching purposes.
-///
-/// `AnyValue` is a oneof with seven variants (`stringValue`, `intValue`,
-/// `boolValue`, `doubleValue`, `bytesValue`, `arrayValue`, `kvlistValue`).
-/// Scalar variants get stringified; container/binary variants return
-/// `None` because there's no canonical text form for matching.
-fn any_value_to_string(value: &Value) -> Option<Cow<'_, str>> {
-    let obj = value.as_object()?;
-    if let Some(v) = obj.get("stringValue")
-        && let Some(s) = v.as_str()
-    {
-        return Some(s);
-    }
-    if let Some(v) = obj.get("intValue")
-        && let Some(i) = v.as_integer()
-    {
-        return Some(Cow::Owned(i.to_string()));
-    }
-    if let Some(v) = obj.get("boolValue")
-        && let Some(b) = v.as_boolean()
-    {
-        return Some(Cow::Borrowed(if b { "true" } else { "false" }));
-    }
-    if let Some(v) = obj.get("doubleValue")
-        && let Some(f) = v.as_float()
-    {
-        return Some(Cow::Owned(f.to_string()));
-    }
-    None
-}
-
-/// Coerce a plain (non-`AnyValue`) `Value` to a string for matching —
-/// used for simple OTLP fields like `severityText`, `traceId`, `spanId`,
-/// which are flat strings rather than wrapped `AnyValue` objects.
-fn plain_value_to_string(value: &Value) -> Option<Cow<'_, str>> {
-    match value {
-        Value::Bytes(_) => value.as_str(),
-        Value::Integer(i) => Some(Cow::Owned(i.to_string())),
-        Value::Float(f) => Some(Cow::Owned(f.to_string())),
-        Value::Boolean(b) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
+/// Coerce an OTLP `AnyValue` to a string for matching. Only a non-empty
+/// `stringValue` is matchable; all other variants (`intValue`, `boolValue`,
+/// `arrayValue`, …) return `None` so string matchers and regex redaction
+/// never operate on them.
+fn any_value_string(value: Option<&Value>) -> Option<Cow<'_, str>> {
+    let obj = value?.as_object()?;
+    match obj.get("stringValue").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => Some(s),
         _ => None,
     }
 }
 
-/// Linear scan of an OTLP attributes array for the entry whose key
-/// matches.
-fn find_attribute_value<'a>(attrs: &'a Value, key: &str) -> Option<Cow<'a, str>> {
-    let array = attrs.as_array()?;
-    for item in array {
-        if attribute_key(item) == Some(key) {
-            return item
-                .as_object()
-                .and_then(|o| o.get("value"))
-                .and_then(any_value_to_string);
+/// Whether an `AnyValue` carries any value variant at all. Powers
+/// `exists: true` matchers for attributes whose value isn't a string.
+fn any_value_present(value: Option<&Value>) -> bool {
+    const VARIANTS: [&str; 7] = [
+        "stringValue",
+        "boolValue",
+        "intValue",
+        "doubleValue",
+        "arrayValue",
+        "kvlistValue",
+        "bytesValue",
+    ];
+    match value.and_then(Value::as_object) {
+        Some(obj) => VARIANTS.iter().any(|k| obj.get(*k).is_some()),
+        None => false,
+    }
+}
+
+/// Presence semantics for the `body` field: an empty `stringValue` counts as
+/// missing, but any other present variant counts as present.
+fn log_body_present(value: Option<&Value>) -> bool {
+    let Some(obj) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    if let Some(s) = obj.get("stringValue").and_then(Value::as_str) {
+        return !s.is_empty();
+    }
+    ["boolValue", "intValue", "doubleValue", "arrayValue", "kvlistValue", "bytesValue"]
+        .iter()
+        .any(|k| obj.get(*k).is_some())
+}
+
+/// Coerce a plain string `Value` to a non-empty string. Empty strings count
+/// as absent, matching the reference adapter's `non_empty` helper.
+pub(super) fn non_empty(value: Option<&Value>) -> Option<Cow<'_, str>> {
+    match value?.as_str() {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    }
+}
+
+// =============================================================================
+// Attribute lookup (walks nested kvlistValue).
+// =============================================================================
+
+pub(super) fn find_attribute_path<'a>(
+    attrs: Option<&'a Value>,
+    path: &[String],
+) -> Option<Cow<'a, str>> {
+    let array = attrs?.as_array()?;
+    find_in_kvlist(array, path)
+}
+
+fn find_in_kvlist<'a>(attrs: &'a [Value], path: &[String]) -> Option<Cow<'a, str>> {
+    let first = path.first()?;
+    for kv in attrs {
+        if attribute_key(kv) != Some(first.as_str()) {
+            continue;
         }
+        let value = kv.as_object().and_then(|o| o.get("value"));
+        if path.len() == 1 {
+            return any_value_string(value);
+        }
+        return nested_values(value).and_then(|nested| find_in_kvlist(nested, &path[1..]));
     }
     None
 }
 
-/// Like [`find_attribute_value`] but returns whether the key exists at
-/// all — used by `field_exists` so OTLP attributes with non-string
-/// `AnyValue` variants (`intValue`, `boolValue`, `arrayValue`, …) still
-/// satisfy `exists: true` matchers.
-fn attribute_exists(attrs: &Value, key: &str) -> bool {
-    attrs
-        .as_array()
-        .map(|array| array.iter().any(|item| attribute_key(item) == Some(key)))
-        .unwrap_or(false)
+pub(super) fn attribute_exists_path(attrs: Option<&Value>, path: &[String]) -> bool {
+    let Some(array) = attrs.and_then(Value::as_array) else {
+        return false;
+    };
+    exists_in_kvlist(array, path)
 }
 
-fn attribute_index(attrs: &[Value], key: &str) -> Option<usize> {
-    attrs
-        .iter()
-        .position(|item| attribute_key(item) == Some(key))
+fn exists_in_kvlist(attrs: &[Value], path: &[String]) -> bool {
+    let Some(first) = path.first() else {
+        return false;
+    };
+    for kv in attrs {
+        if attribute_key(kv) != Some(first.as_str()) {
+            continue;
+        }
+        let value = kv.as_object().and_then(|o| o.get("value"));
+        if path.len() == 1 {
+            return any_value_present(value);
+        }
+        return nested_values(value)
+            .map(|nested| exists_in_kvlist(nested, &path[1..]))
+            .unwrap_or(false);
+    }
+    false
+}
+
+/// Unwrap an `AnyValue`'s `kvlistValue.values` array.
+fn nested_values(value: Option<&Value>) -> Option<&[Value]> {
+    value
+        .and_then(Value::as_object)
+        .and_then(|o| o.get("kvlistValue"))
+        .and_then(Value::as_object)
+        .and_then(|o| o.get("values"))
+        .and_then(Value::as_array)
 }
 
 fn attribute_key(item: &Value) -> Option<&str> {
@@ -422,6 +526,56 @@ fn attribute_key(item: &Value) -> Option<&str> {
             _ => None,
         })
 }
+
+// =============================================================================
+// Attribute mutation.
+// =============================================================================
+
+/// Set or overwrite the first-segment attribute key with a string value.
+fn set_string_attr(attrs: &mut Vec<Value>, path: &[String], value: &str) {
+    let Some(key) = path.first() else {
+        return;
+    };
+    if let Some(entry) = attrs
+        .iter_mut()
+        .find(|kv| attribute_key(kv) == Some(key.as_str()))
+    {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("value".into(), make_string_any_value(value));
+        }
+        return;
+    }
+    attrs.push(make_attribute_entry(key, make_string_any_value(value)));
+}
+
+/// Remove the first-segment attribute key. Returns whether anything was removed.
+fn remove_attr(attrs: &mut Vec<Value>, path: &[String]) -> bool {
+    let Some(key) = path.first() else {
+        return false;
+    };
+    let before = attrs.len();
+    attrs.retain(|kv| attribute_key(kv) != Some(key.as_str()));
+    attrs.len() < before
+}
+
+/// Remove and return the first-segment attribute entry, preserving its value.
+fn remove_attr_kv(attrs: &mut Vec<Value>, path: &[String]) -> Option<Value> {
+    let key = path.first()?;
+    let idx = attrs
+        .iter()
+        .position(|kv| attribute_key(kv) == Some(key.as_str()))?;
+    Some(attrs.remove(idx))
+}
+
+/// Insert an entry under `key`, removing any existing entry with that key first.
+fn upsert_entry(attrs: &mut Vec<Value>, key: &str, entry: Value) {
+    attrs.retain(|kv| attribute_key(kv) != Some(key));
+    attrs.push(entry);
+}
+
+// =============================================================================
+// Value construction.
+// =============================================================================
 
 /// Build an `AnyValue` object wrapping a string.
 fn make_string_any_value(value: &str) -> Value {
@@ -438,50 +592,28 @@ fn make_attribute_entry(key: &str, value: Value) -> Value {
     Value::Object(obj)
 }
 
-/// Insert (or overwrite) an attribute entry by key, wrapping the value
-/// as a string `AnyValue`.
-fn set_attribute(attrs: &mut Vec<Value>, key: &str, value: &str) {
-    let any_value = make_string_any_value(value);
-    if let Some(idx) = attribute_index(attrs, key) {
-        if let Some(obj) = attrs[idx].as_object_mut() {
-            obj.insert("value".into(), any_value);
-        }
-    } else {
-        attrs.push(make_attribute_entry(key, any_value));
-    }
-}
-
-/// Remove an attribute entry by key. Returns whether an entry was
-/// removed.
-fn remove_attribute(attrs: &mut Vec<Value>, key: &str) -> bool {
-    match attribute_index(attrs, key) {
-        Some(idx) => {
-            attrs.remove(idx);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Ensure the log record has an `attributes` array — create an empty one
-/// if absent so `set_attribute` has somewhere to push.
-fn ensure_attributes_array(log_record: &mut Value) {
-    let needs_init = log_record
-        .as_object()
-        .and_then(|o| o.get("attributes"))
-        .map(|v| !matches!(v, Value::Array(_)))
-        .unwrap_or(true);
-    if needs_init && let Some(obj) = log_record.as_object_mut() {
+/// Get-or-create the `attributes` array of a record / resource / scope.
+fn ensure_attributes(parent: &mut Value) -> Option<&mut Vec<Value>> {
+    let obj = parent.as_object_mut()?;
+    if !matches!(obj.get("attributes"), Some(Value::Array(_))) {
         obj.insert("attributes".into(), Value::Array(Vec::new()));
     }
+    obj.get_mut("attributes").and_then(Value::as_array_mut)
 }
 
-/// `policy-rs` attribute selectors are multi-segment paths. In OTel mode
-/// we collapse them with a literal dot — the OTel convention is that
-/// nested attribute keys (e.g. `"service.name"`) live as a single
-/// flat key with embedded dots.
-fn join_path(segments: &[String]) -> String {
-    segments.join(".")
+/// Borrow the existing `attributes` array, if present.
+fn attributes_of_mut(parent: &mut Value) -> Option<&mut Vec<Value>> {
+    parent
+        .as_object_mut()
+        .and_then(|o| o.get_mut("attributes"))
+        .and_then(Value::as_array_mut)
+}
+
+fn remove_key(record: &mut Value, key: &str) -> bool {
+    match record.as_object_mut() {
+        Some(obj) => obj.remove(key).is_some(),
+        None => false,
+    }
 }
 
 fn insert_simple_string(record: &mut Value, key: &str, value: &str) {
@@ -494,323 +626,217 @@ fn insert_simple_string(record: &mut Value, key: &str, value: &str) {
 mod tests {
     use super::*;
 
-    /// Build a single OTLP log record `Value` with the given body and a
-    /// `user_id` string attribute. Keeps the test bodies tiny.
-    fn record_with_body_and_attr(body: &str, attr_key: &str, attr_val: &str) -> Value {
+    fn any_int(v: i64) -> Value {
+        let mut obj = ObjectMap::new();
+        obj.insert("intValue".into(), Value::Integer(v));
+        Value::Object(obj)
+    }
+
+    fn record_with_attr(attr_key: &str, attr_val: Value) -> Value {
         let mut record = ObjectMap::new();
-        record.insert("body".into(), make_string_any_value(body));
+        record.insert("body".into(), make_string_any_value("hi"));
         record.insert("severityText".into(), Value::from("INFO".to_string()));
         record.insert(
             "attributes".into(),
-            Value::Array(vec![make_attribute_entry(
-                attr_key,
-                make_string_any_value(attr_val),
-            )]),
+            Value::Array(vec![make_attribute_entry(attr_key, attr_val)]),
         );
         Value::Object(record)
     }
 
-    fn resource_with_attr(key: &str, val: &str) -> Value {
-        let mut resource = ObjectMap::new();
-        resource.insert(
+    fn obj_with_attrs(pairs: Vec<(&str, Value)>) -> Value {
+        let mut o = ObjectMap::new();
+        o.insert(
             "attributes".into(),
-            Value::Array(vec![make_attribute_entry(key, make_string_any_value(val))]),
+            Value::Array(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| make_attribute_entry(k, v))
+                    .collect(),
+            ),
         );
-        Value::Object(resource)
+        Value::Object(o)
     }
 
-    fn scope_with_attr(key: &str, val: &str) -> Value {
-        let mut scope = ObjectMap::new();
-        scope.insert("name".into(), Value::from("test".to_string()));
-        scope.insert(
-            "attributes".into(),
-            Value::Array(vec![make_attribute_entry(key, make_string_any_value(val))]),
-        );
-        Value::Object(scope)
+    fn get(adapter: &OtlpLogAdapter, sel: LogFieldSelector) -> Option<String> {
+        adapter.get_field(&sel).map(|c| c.into_owned())
     }
 
     #[test]
-    fn any_value_string() {
-        let v = make_string_any_value("hello");
-        assert_eq!(any_value_to_string(&v).as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn any_value_int_stringifies() {
-        let mut obj = ObjectMap::new();
-        obj.insert("intValue".into(), Value::Integer(42));
-        assert_eq!(
-            any_value_to_string(&Value::Object(obj)).as_deref(),
-            Some("42"),
-        );
-    }
-
-    #[test]
-    fn any_value_bool_stringifies() {
-        let mut obj = ObjectMap::new();
-        obj.insert("boolValue".into(), Value::Boolean(true));
-        assert_eq!(
-            any_value_to_string(&Value::Object(obj)).as_deref(),
-            Some("true"),
-        );
-    }
-
-    #[test]
-    fn any_value_double_stringifies() {
-        let mut obj = ObjectMap::new();
-        obj.insert(
-            "doubleValue".into(),
-            Value::Float(ordered_float::NotNan::new(1.5).unwrap()),
-        );
-        assert!(matches!(
-            any_value_to_string(&Value::Object(obj)).as_deref(),
-            Some(s) if s.starts_with("1.5"),
-        ));
-    }
-
-    #[test]
-    fn any_value_array_returns_none_for_matching() {
-        let mut obj = ObjectMap::new();
-        obj.insert("arrayValue".into(), Value::Array(vec![]));
-        assert_eq!(any_value_to_string(&Value::Object(obj)), None);
-    }
-
-    #[test]
-    fn get_body_string() {
-        let mut record = record_with_body_and_attr("hi", "user_id", "42");
+    fn matches_string_attribute() {
+        let mut record = record_with_attr("user_id", make_string_any_value("42"));
         let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
         assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::Simple(LogField::Body))
-                .as_deref(),
-            Some("hi"),
+            get(
+                &adapter,
+                LogFieldSelector::LogAttribute(vec!["user_id".into()])
+            ),
+            Some("42".to_string())
         );
     }
 
     #[test]
-    fn get_log_attribute_flat() {
-        let mut record = record_with_body_and_attr("hi", "user_id", "42");
+    fn int_attribute_is_not_matchable_but_exists() {
+        let mut record = record_with_attr("count", any_int(42));
         let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        // get_field must return None (not "42") so a regex redact won't fire.
         assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::LogAttribute(vec!["user_id".to_string()]))
-                .as_deref(),
-            Some("42"),
+            get(&adapter, LogFieldSelector::LogAttribute(vec!["count".into()])),
+            None
         );
+        // but exists: true must still match.
+        assert!(adapter.field_exists(&LogFieldSelector::LogAttribute(vec!["count".into()])));
     }
 
     #[test]
-    fn get_log_attribute_nested_dot_joins() {
-        let mut record = record_with_body_and_attr("x", "http.method", "GET");
-        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-        assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::LogAttribute(vec![
-                    "http".to_string(),
-                    "method".to_string()
-                ]))
-                .as_deref(),
-            Some("GET"),
-        );
-    }
-
-    #[test]
-    fn get_resource_attribute_via_immutable_ref() {
-        let mut record = record_with_body_and_attr("x", "noise", "v");
-        let resource = resource_with_attr("service.name", "frontend");
-        let adapter = OtlpLogAdapter::new(&mut record, Some(&resource), None, None, None);
-        assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::ResourceAttribute(vec![
-                    "service.name".to_string()
-                ]))
-                .as_deref(),
-            Some("frontend"),
-        );
-    }
-
-    #[test]
-    fn get_scope_attribute_via_immutable_ref() {
-        let mut record = record_with_body_and_attr("x", "noise", "v");
-        let scope = scope_with_attr("library", "tracer");
-        let adapter = OtlpLogAdapter::new(&mut record, None, Some(&scope), None, None);
-        assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::ScopeAttribute(vec![
-                    "library".to_string()
-                ]))
-                .as_deref(),
-            Some("tracer"),
-        );
-    }
-
-    #[test]
-    fn get_resource_schema_url() {
-        let mut record = record_with_body_and_attr("x", "noise", "v");
-        let schema = Value::from("https://opentelemetry.io/schemas/1.0".to_string());
-        let adapter = OtlpLogAdapter::new(&mut record, None, None, Some(&schema), None);
-        assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::Simple(LogField::ResourceSchemaUrl))
-                .as_deref(),
-            Some("https://opentelemetry.io/schemas/1.0"),
-        );
-    }
-
-    #[test]
-    fn field_exists_for_non_string_attribute() {
-        // intValue attribute must satisfy exists matchers even though
-        // get_field returns Some("42").
+    fn empty_string_simple_field_is_absent() {
         let mut record = ObjectMap::new();
-        record.insert("body".into(), make_string_any_value("x"));
-        let mut attr_value = ObjectMap::new();
-        attr_value.insert("intValue".into(), Value::Integer(42));
-        record.insert(
-            "attributes".into(),
+        record.insert("spanId".into(), Value::from(String::new()));
+        record.insert("severityText".into(), Value::from("INFO".to_string()));
+        let mut record = Value::Object(record);
+        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        assert!(!adapter.field_exists(&LogFieldSelector::Simple(LogField::SpanId)));
+        assert!(adapter.field_exists(&LogFieldSelector::Simple(LogField::SeverityText)));
+    }
+
+    #[test]
+    fn hex_span_id_is_matched_verbatim() {
+        let mut record = ObjectMap::new();
+        record.insert("spanId".into(), Value::from("7370616e30303031".to_string()));
+        let mut record = Value::Object(record);
+        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        assert_eq!(
+            get(&adapter, LogFieldSelector::Simple(LogField::SpanId)),
+            Some("7370616e30303031".to_string())
+        );
+    }
+
+    #[test]
+    fn body_present_only_when_non_empty() {
+        // Missing body.
+        let mut record = Value::Object(ObjectMap::new());
+        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        assert!(!adapter.field_exists(&LogFieldSelector::Simple(LogField::Body)));
+
+        // Empty AnyValue (body: {}) counts as missing.
+        let mut record = ObjectMap::new();
+        record.insert("body".into(), Value::Object(ObjectMap::new()));
+        let mut record = Value::Object(record);
+        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        assert!(!adapter.field_exists(&LogFieldSelector::Simple(LogField::Body)));
+    }
+
+    #[test]
+    fn add_body_when_missing() {
+        let mut record = Value::Object(ObjectMap::new());
+        {
+            let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+            adapter.set_field(&LogFieldSelector::Simple(LogField::Body), "[no body provided]");
+        }
+        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        assert_eq!(
+            get(&adapter, LogFieldSelector::Simple(LogField::Body)),
+            Some("[no body provided]".to_string())
+        );
+    }
+
+    #[test]
+    fn walks_nested_kvlist() {
+        let mut inner = ObjectMap::new();
+        inner.insert(
+            "values".into(),
             Value::Array(vec![make_attribute_entry(
-                "count",
-                Value::Object(attr_value),
+                "method",
+                make_string_any_value("GET"),
             )]),
         );
-        let mut record = Value::Object(record);
-        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-        assert!(adapter.field_exists(&LogFieldSelector::LogAttribute(vec!["count".to_string()])));
-    }
-
-    #[test]
-    fn set_attribute_overwrites_existing() {
-        let mut record = record_with_body_and_attr("x", "user_id", "42");
-        {
-            let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-            adapter.set_field(
-                &LogFieldSelector::LogAttribute(vec!["user_id".to_string()]),
-                "99",
-            );
-        }
+        let mut http_val = ObjectMap::new();
+        http_val.insert("kvlistValue".into(), Value::Object(inner));
+        let mut record = record_with_attr("http", Value::Object(http_val));
         let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
         assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::LogAttribute(vec!["user_id".to_string()]))
-                .as_deref(),
-            Some("99"),
+            get(
+                &adapter,
+                LogFieldSelector::LogAttribute(vec!["http".into(), "method".into()])
+            ),
+            Some("GET".to_string())
         );
+        assert!(adapter.field_exists(&LogFieldSelector::LogAttribute(vec![
+            "http".into(),
+            "method".into()
+        ])));
     }
 
     #[test]
-    fn set_attribute_creates_when_absent() {
-        let mut record = ObjectMap::new();
-        record.insert("body".into(), make_string_any_value("x"));
-        let mut record = Value::Object(record);
+    fn resource_attribute_is_mutable() {
+        let mut record = record_with_attr("noise", make_string_any_value("v"));
+        let mut resource = obj_with_attrs(vec![("existing", make_string_any_value("x"))]);
         {
-            let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+            let mut adapter =
+                OtlpLogAdapter::new(&mut record, Some(&mut resource), None, None, None);
             adapter.set_field(
-                &LogFieldSelector::LogAttribute(vec!["new".to_string()]),
-                "v",
+                &LogFieldSelector::ResourceAttribute(vec!["processed_by".into()]),
+                "policy",
             );
         }
-        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        let adapter = OtlpLogAdapter::new(&mut record, Some(&mut resource), None, None, None);
         assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::LogAttribute(vec!["new".to_string()]))
-                .as_deref(),
-            Some("v"),
+            get(
+                &adapter,
+                LogFieldSelector::ResourceAttribute(vec!["processed_by".into()])
+            ),
+            Some("policy".to_string())
         );
     }
 
     #[test]
-    fn set_simple_body_replaces_any_value() {
-        let mut record = record_with_body_and_attr("old", "k", "v");
+    fn scope_attribute_remove_and_rename() {
+        let mut record = record_with_attr("noise", make_string_any_value("v"));
+        let mut scope = obj_with_attrs(vec![
+            ("secret", make_string_any_value("abc")),
+            ("old", make_string_any_value("val")),
+        ]);
         {
-            let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-            adapter.set_field(&LogFieldSelector::Simple(LogField::Body), "new");
-        }
-        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-        assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::Simple(LogField::Body))
-                .as_deref(),
-            Some("new"),
-        );
-    }
-
-    #[test]
-    fn set_resource_attribute_is_noop() {
-        let mut record = record_with_body_and_attr("x", "k", "v");
-        let resource = resource_with_attr("a", "b");
-        let resource_before = resource.clone();
-        {
-            let mut adapter = OtlpLogAdapter::new(&mut record, Some(&resource), None, None, None);
-            adapter.set_field(
-                &LogFieldSelector::ResourceAttribute(vec!["a".to_string()]),
-                "ignored",
-            );
-        }
-        assert_eq!(resource, resource_before, "resource must not be mutated");
-    }
-
-    #[test]
-    fn delete_attribute_present() {
-        let mut record = record_with_body_and_attr("x", "user_id", "42");
-        let removed = {
-            let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-            adapter.delete_field(&LogFieldSelector::LogAttribute(vec!["user_id".to_string()]))
-        };
-        assert!(removed);
-        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-        assert!(
-            adapter
-                .get_field(&LogFieldSelector::LogAttribute(vec!["user_id".to_string()]))
-                .is_none(),
-        );
-    }
-
-    #[test]
-    fn delete_attribute_absent_returns_false() {
-        let mut record = record_with_body_and_attr("x", "user_id", "42");
-        let removed = {
-            let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-            adapter.delete_field(&LogFieldSelector::LogAttribute(vec!["other".to_string()]))
-        };
-        assert!(!removed);
-    }
-
-    #[test]
-    fn delete_simple_body() {
-        let mut record = record_with_body_and_attr("x", "k", "v");
-        let removed = {
-            let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-            adapter.delete_field(&LogFieldSelector::Simple(LogField::Body))
-        };
-        assert!(removed);
-        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-        assert!(
-            adapter
-                .get_field(&LogFieldSelector::Simple(LogField::Body))
-                .is_none(),
-        );
-    }
-
-    #[test]
-    fn move_attribute_within_log_attributes() {
-        let mut record = record_with_body_and_attr("x", "usr", "admin");
-        {
-            let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+            let mut adapter =
+                OtlpLogAdapter::new(&mut record, None, Some(&mut scope), None, None);
+            assert!(adapter.delete_field(&LogFieldSelector::ScopeAttribute(vec!["secret".into()])));
             adapter.move_field(
-                &LogFieldSelector::LogAttribute(vec!["usr".to_string()]),
-                &LogFieldSelector::LogAttribute(vec!["user_id".to_string()]),
+                &LogFieldSelector::ScopeAttribute(vec!["old".into()]),
+                &LogFieldSelector::ScopeAttribute(vec!["new".into()]),
             );
         }
-        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-        assert!(
-            adapter
-                .get_field(&LogFieldSelector::LogAttribute(vec!["usr".to_string()]))
-                .is_none(),
-        );
+        let adapter = OtlpLogAdapter::new(&mut record, None, Some(&mut scope), None, None);
+        assert!(get(&adapter, LogFieldSelector::ScopeAttribute(vec!["secret".into()])).is_none());
+        assert!(get(&adapter, LogFieldSelector::ScopeAttribute(vec!["old".into()])).is_none());
         assert_eq!(
-            adapter
-                .get_field(&LogFieldSelector::LogAttribute(vec!["user_id".to_string()]))
-                .as_deref(),
-            Some("admin"),
+            get(&adapter, LogFieldSelector::ScopeAttribute(vec!["new".into()])),
+            Some("val".to_string())
         );
+    }
+
+    #[test]
+    fn redact_regex_skips_non_string_value() {
+        // Mirrors logs_transform_redact_regex_non_string_value: an intValue
+        // attribute must be left untouched because get_field returns None.
+        let mut record = record_with_attr("count", any_int(42));
+        {
+            let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+            // The engine reads the value first; None means redact is skipped.
+            assert!(
+                adapter
+                    .get_field(&LogFieldSelector::LogAttribute(vec!["count".into()]))
+                    .is_none()
+            );
+        }
+        // The underlying intValue is still present and unchanged.
+        let count = record
+            .get("attributes")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|kv| kv.as_object())
+            .and_then(|o| o.get("value"))
+            .and_then(Value::as_object)
+            .and_then(|o| o.get("intValue"))
+            .cloned();
+        assert_eq!(count, Some(Value::Integer(42)));
     }
 }
