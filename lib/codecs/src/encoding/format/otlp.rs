@@ -97,7 +97,15 @@ impl OtlpSerializer {
 impl Encoder<Event> for OtlpSerializer {
     type Error = vector_common::Error;
 
-    fn encode(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, mut event: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
+        // The in-memory tree carries trace/span ids as hex strings (canonical
+        // OTLP/JSON). Convert them back to raw `bytes` before protobuf encoding.
+        match &mut event {
+            Event::Log(log) => crate::common::otlp::hex_decode_ids(log.value_mut()),
+            Event::Trace(trace) => crate::common::otlp::hex_decode_ids(trace.value_mut()),
+            Event::Metric(_) => {}
+        }
+
         // Determine which descriptor to use based on top-level OTLP fields
         // This handles events that were decoded with use_otlp_decoding enabled
         // The deserializer uses use_json_names: true, so fields are in camelCase

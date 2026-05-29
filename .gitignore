@@ -2,6 +2,7 @@
 cargo-timing*.html
 **/*.rs.bk
 target
+target-test
 tests/data/wasm/*/target
 bench_output.txt
 rust-analyzer.toml

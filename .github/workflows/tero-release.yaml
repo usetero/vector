@@ -1,0 +1,361 @@
+---
+# Tero release pipeline.
+#
+# Triggers on `v*` tags created by `tero-release-please.yaml` (or `workflow_dispatch`
+# for a smoke test). Builds the Vector binary natively on amd64 + arm64
+# Linux runners, produces a tarball per arch, then bakes both into a
+# multi-arch Docker image at `ghcr.io/${REPO}:VERSION`, and finally attaches
+# the tarballs to the GitHub Release that release-please already created.
+#
+# This pipeline is intentionally narrow — no .deb / .rpm / .msi / macOS /
+# Windows / musl / armv7. The upstream `release.yml` / `publish.yml`
+# pipelines that produce those artifacts remain untouched but should be
+# disabled in repository Settings → Actions → Workflows for this fork
+# (see distribution/docker/tero/README.md).
+
+name: Tero release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (without v prefix). Use for dry runs."
+        required: false
+        default: "0.0.0-tero.dryrun"
+      dry_run:
+        description: "Build but do not push images or attach release assets."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C strip=symbols"
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-24.04
+    if: github.repository_owner == 'usetero'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Determine version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            VERSION="${INPUT_VERSION}"
+          else
+            VERSION="${REF#refs/tags/v}"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved version: ${VERSION}"
+
+  build-binary:
+    name: Build binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: prepare
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        # Vectorscan (via `vectorscan-rs-sys`) needs cmake + a C++ toolchain
+        # + ragel + libpcre2. Everything else (libsasl2, libssl, krb5) is
+        # required by Vector's default `target-*` feature set.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libboost-dev \
+            libclang-dev \
+            libpcre2-dev \
+            libprotobuf-dev \
+            libsasl2-dev \
+            libssl-dev \
+            libxml2-dev \
+            pkg-config \
+            protobuf-compiler \
+            ragel \
+            unzip
+          # `target-*-linux-gnu` pulls in `vendored` which builds krb5/gssapi
+          # from source; install its build-time prereqs too.
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            comerr-dev \
+            libkrb5-dev
+
+      - name: Install Rust toolchain
+        # rust-toolchain.toml pins the channel — the action respects it.
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: tero-release-${{ matrix.triple }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            tero-release-${{ matrix.triple }}-
+
+      - name: Build Vector
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          cargo build \
+            --release \
+            --target "${TRIPLE}" \
+            --no-default-features \
+            --features "target-${TRIPLE},transforms-policy"
+
+      - name: Stage binary artifacts
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          ARCHIVE_DIR="vector-${VERSION}-${TRIPLE}"
+          mkdir -p "${ARCHIVE_DIR}"
+          cp "target/${TRIPLE}/release/vector" "${ARCHIVE_DIR}/vector"
+          cp LICENSE "${ARCHIVE_DIR}/LICENSE"
+          cp README.md "${ARCHIVE_DIR}/README.md"
+          chmod +x "${ARCHIVE_DIR}/vector"
+          tar -czf "${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
+          sha256sum "${ARCHIVE_DIR}.tar.gz" > "${ARCHIVE_DIR}.tar.gz.sha256"
+          ls -lh "${ARCHIVE_DIR}.tar.gz"
+
+      - name: Verify binary
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: "./target/${TRIPLE}/release/vector --version"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-binary-${{ matrix.arch }}
+          path: |
+            vector-*.tar.gz
+            vector-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload bare binary for Docker stage
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-bin-${{ matrix.arch }}
+          path: target/${{ matrix.triple }}/release/vector
+          if-no-files-found: error
+          retention-days: 1
+
+  build-docker:
+    name: Build Docker image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [prepare, build-binary]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binary for this arch
+        uses: actions/download-artifact@v4
+        with:
+          name: vector-bin-${{ matrix.arch }}
+          path: ${{ matrix.arch }}/
+
+      - name: Assemble build context
+        run: |
+          chmod +x "${{ matrix.arch }}/vector"
+          ls -la "${{ matrix.arch }}/"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: ${{ !inputs.dry_run }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: distribution/docker/tero/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ !inputs.dry_run }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        if: ${{ !inputs.dry_run }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: ${{ !inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-docker-manifest:
+    name: Merge Docker manifests
+    runs-on: ubuntu-24.04
+    needs: [prepare, build-docker]
+    if: ${{ !inputs.dry_run }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=sha
+
+      - name: Create multi-arch manifest and push
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "${DOCKER_METADATA_OUTPUT_JSON}") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}
+        run: docker buildx imagetools inspect "${IMAGE}"
+
+  upload-release-assets:
+    name: Attach binaries to GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [prepare, build-binary, merge-docker-manifest]
+    if: ${{ !inputs.dry_run && github.event_name == 'push' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/assets
+          pattern: vector-binary-*
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la /tmp/assets
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        # `gh release upload` requires the release to already exist. release-please
+        # creates it at tag time; this job runs immediately after, so the release
+        # should be there. `--clobber` lets us re-run safely.
+        run: |
+          cd /tmp/assets
+          gh release upload "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --clobber \
+            vector-*.tar.gz \
+            vector-*.tar.gz.sha256
+
+  summary:
+    name: Release summary
+    runs-on: ubuntu-24.04
+    needs: [prepare, build-binary, build-docker, merge-docker-manifest, upload-release-assets]
+    if: always()
+    steps:
+      - name: Summarize
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "## Tero Vector release"
+            echo
+            echo "Version: \`${VERSION}\`"
+            echo
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "**Dry run.** Artifacts built; nothing pushed."
+            else
+              echo "Docker image:"
+              echo
+              echo "    docker pull ${IMAGE}:${VERSION}"
+              echo
+              echo "Binary tarballs:"
+              echo
+              echo "* \`vector-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\`"
+              echo "* \`vector-${VERSION}-aarch64-unknown-linux-gnu.tar.gz\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

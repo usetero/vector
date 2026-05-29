@@ -163,20 +163,23 @@ impl Deserializer for OtlpDeserializer {
         for signal_type in &self.signals {
             match signal_type {
                 OtlpSignalType::Logs => {
-                    if let Ok(events) = self.logs_deserializer.parse(bytes.clone(), log_namespace)
+                    if let Ok(mut events) =
+                        self.logs_deserializer.parse(bytes.clone(), log_namespace)
                         && let Some(Event::Log(log)) = events.first()
                         && log.get(RESOURCE_LOGS_JSON_FIELD).is_some()
                     {
+                        normalize_ids(&mut events);
                         return Ok(events);
                     }
                 }
                 OtlpSignalType::Metrics => {
-                    if let Ok(events) = self
+                    if let Ok(mut events) = self
                         .metrics_deserializer
                         .parse(bytes.clone(), log_namespace)
                         && let Some(Event::Log(log)) = events.first()
                         && log.get(RESOURCE_METRICS_JSON_FIELD).is_some()
                     {
+                        normalize_ids(&mut events);
                         return Ok(events);
                     }
                 }
@@ -188,7 +191,8 @@ impl Deserializer for OtlpDeserializer {
                         && log.get(RESOURCE_SPANS_JSON_FIELD).is_some()
                     {
                         // Convert the log event to a trace event by taking ownership
-                        if let Some(Event::Log(log)) = events.pop() {
+                        if let Some(Event::Log(mut log)) = events.pop() {
+                            crate::common::otlp::hex_encode_ids(log.value_mut());
                             let trace_event = Event::Trace(log.into());
                             return Ok(smallvec![trace_event]);
                         }
@@ -198,6 +202,17 @@ impl Deserializer for OtlpDeserializer {
         }
 
         Err(format!("Invalid OTLP data: expected one of {:?}", self.signals).into())
+    }
+}
+
+/// Hex-encode the OTLP id `bytes` fields (`traceId`/`spanId`/`parentSpanId`) of
+/// every log event so the in-memory tree carries canonical OTLP/JSON hex
+/// strings rather than raw bytes.
+fn normalize_ids(events: &mut SmallVec<[Event; 1]>) {
+    for event in events.iter_mut() {
+        if let Event::Log(log) = event {
+            crate::common::otlp::hex_encode_ids(log.value_mut());
+        }
     }
 }
 
@@ -341,28 +356,28 @@ mod tests {
 
         let span = spans.first().expect("should have at least one span");
 
-        // Verify traceId - should be raw bytes (16 bytes for trace_id)
+        // Verify traceId - normalized to a lowercase hex string (OTLP/JSON form)
         let trace_id = span
             .get("traceId")
-            .and_then(|v| v.as_bytes())
-            .expect("traceId should exist and be bytes");
+            .and_then(|v| v.as_str())
+            .expect("traceId should exist and be a hex string");
 
         assert_eq!(
             trace_id.as_ref(),
-            &TEST_TRACE_ID,
-            "traceId should match the expected 16 bytes (0102030405060708090a0b0c0d0e0f10)"
+            "0102030405060708090a0b0c0d0e0f10",
+            "traceId should be the hex encoding of the 16 raw bytes"
         );
 
-        // Verify spanId - should be raw bytes (8 bytes for span_id)
+        // Verify spanId - normalized to a lowercase hex string (OTLP/JSON form)
         let span_id = span
             .get("spanId")
-            .and_then(|v| v.as_bytes())
-            .expect("spanId should exist and be bytes");
+            .and_then(|v| v.as_str())
+            .expect("spanId should exist and be a hex string");
 
         assert_eq!(
             span_id.as_ref(),
-            &TEST_SPAN_ID,
-            "spanId should match the expected 8 bytes (0102030405060708)"
+            "0102030405060708",
+            "spanId should be the hex encoding of the 8 raw bytes"
         );
     }
 
