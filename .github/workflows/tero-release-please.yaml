@@ -41,11 +41,6 @@ jobs:
           owner: ${{ github.repository_owner }}
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         with:
-          # GITHUB_TOKEN works, but PRs it creates cannot trigger other
-          # workflows. If you want `tero-release.yaml` to fire when the
-          # release PR is merged (and the tag is pushed automatically), swap
-          # this for a PAT or GitHub App token. Today the tag push DOES
-          # trigger workflows because release-please pushes it directly.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.generate-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
