@@ -20,8 +20,10 @@ use policy_rs::{
 };
 use vector_lib::event::{TraceEvent, Value};
 
-use super::internal_events::{DropCounts, DropReason};
-use super::otlp_adapter::{attribute_exists_path, find_attribute_path, non_empty};
+use super::internal_events::{DropCounts, DropReason, EvalErrors};
+use super::otlp_adapter::{
+    attribute_exists_path, find_attribute_path, lift_child, non_empty, reattach_child,
+};
 
 /// Iterate every span in an OTLP traces envelope, sampling/dropping in place.
 /// Returns `true` if any span survives (forward the event), `false` if the
@@ -41,13 +43,12 @@ pub(super) async fn evaluate_traces_envelope(
     };
 
     let mut drops = DropCounts::default();
+    let mut errors = EvalErrors::default();
     let mut i = 0;
     while i < resource_spans.len() {
         // Lift resource/scope out (a move, not a clone) so the adapter can read
         // them while we mutate the sibling `spans` array; re-attached after.
-        let resource = resource_spans[i]
-            .as_object_mut()
-            .and_then(|o| o.remove("resource"));
+        let resource = lift_child(&mut resource_spans[i], "resource");
         let resource_schema_url = resource_spans[i].get("schemaUrl").cloned();
 
         let mut prune_rs = false;
@@ -58,9 +59,7 @@ pub(super) async fn evaluate_traces_envelope(
         {
             let mut j = 0;
             while j < scope_spans.len() {
-                let scope = scope_spans[j]
-                    .as_object_mut()
-                    .and_then(|o| o.remove("scope"));
+                let scope = lift_child(&mut scope_spans[j], "scope");
                 let scope_schema_url = scope_spans[j].get("schemaUrl").cloned();
 
                 let mut prune_ss = false;
@@ -93,10 +92,7 @@ pub(super) async fn evaluate_traces_envelope(
                             }
                             Ok(_) => true,
                             Err(error) => {
-                                error!(
-                                    message = "Policy evaluation failed; OTLP span passed through unchanged.",
-                                    %error,
-                                );
+                                errors.record(&error);
                                 true
                             }
                         };
@@ -110,11 +106,11 @@ pub(super) async fn evaluate_traces_envelope(
                     prune_ss = spans.is_empty();
                 }
 
-                // Re-attach the (read-only) scope.
-                if let Some(scope) = scope
-                    && let Some(obj) = scope_spans[j].as_object_mut()
+                // Re-attach scope only if the entry survives.
+                if !prune_ss
+                    && let Some(scope) = scope
                 {
-                    obj.insert("scope".into(), scope);
+                    reattach_child(&mut scope_spans[j], "scope", scope);
                 }
 
                 if prune_ss {
@@ -126,11 +122,10 @@ pub(super) async fn evaluate_traces_envelope(
             prune_rs = scope_spans.is_empty();
         }
 
-        // Re-attach the (read-only) resource.
-        if let Some(resource) = resource
-            && let Some(obj) = resource_spans[i].as_object_mut()
+        if !prune_rs
+            && let Some(resource) = resource
         {
-            obj.insert("resource".into(), resource);
+            reattach_child(&mut resource_spans[i], "resource", resource);
         }
 
         if prune_rs {
@@ -141,6 +136,7 @@ pub(super) async fn evaluate_traces_envelope(
     }
 
     drops.emit();
+    errors.emit();
     !resource_spans.is_empty()
 }
 

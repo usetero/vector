@@ -42,7 +42,7 @@ pub(crate) struct DropCounts {
 }
 
 impl DropCounts {
-    pub(crate) fn record(&mut self, reason: DropReason) {
+    pub(crate) const fn record(&mut self, reason: DropReason) {
         match reason {
             DropReason::PolicyDrop => self.policy_drop += 1,
             DropReason::SampleRejected => self.sample_rejected += 1,
@@ -67,6 +67,39 @@ pub(crate) fn emit_dropped(reason: DropReason, count: u64) {
         count: count as usize,
         reason: reason.as_str(),
     });
+}
+
+/// Per-envelope accumulator for fail-open evaluation errors.
+///
+/// The transform fails open — an evaluation error passes the record through
+/// untouched rather than dropping it. Logging one `error!` per record would
+/// spam under a systematic failure (e.g. a single malformed input replayed
+/// across an envelope), so we record the first error and a count and emit one
+/// line per envelope.
+#[derive(Default)]
+pub(crate) struct EvalErrors {
+    count: u64,
+    first: Option<String>,
+}
+
+impl EvalErrors {
+    pub(crate) fn record(&mut self, error: &dyn std::fmt::Display) {
+        if self.first.is_none() {
+            self.first = Some(error.to_string());
+        }
+        self.count += 1;
+    }
+
+    pub(crate) fn emit(&self) {
+        if self.count == 0 {
+            return;
+        }
+        error!(
+            message = "Policy evaluation failed; affected OTLP records were passed through unchanged.",
+            count = self.count,
+            error = self.first.as_deref().unwrap_or_default(),
+        );
+    }
 }
 
 #[cfg(test)]

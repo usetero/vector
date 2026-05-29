@@ -22,7 +22,9 @@ use policy_rs::{
 use vector_lib::event::{LogEvent, Value};
 
 use super::internal_events::{DropReason, emit_dropped};
-use super::otlp_adapter::{attribute_exists_path, find_attribute_path, non_empty};
+use super::otlp_adapter::{
+    array_field_is_empty, attribute_exists_path, find_attribute_path, non_empty,
+};
 
 /// Data-variant keys of an OTLP `Metric` (proto3 JSON), paired with the
 /// `MetricFieldSelector::Type` string the engine matches against.
@@ -94,12 +96,15 @@ pub(super) async fn evaluate_metrics_envelope(
             .get_mut("scopeMetrics")
             .and_then(Value::as_array_mut)
         {
-            // `scope_idx` indexes `keep` by original scope position; `j` tracks
-            // the live position as emptied scopes are removed.
+            // Nothing mutates `scopeMetrics`/`metrics` between phases, so the
+            // decision arrays line up with the live arrays. Index defensively
+            // anyway (`.get(..)` + fail-open fallback) so a future desync
+            // degrades to "keep" instead of panicking the transform task.
+            debug_assert_eq!(keep.len(), scope_metrics.len());
             let mut scope_idx = 0;
             let mut j = 0;
             while j < scope_metrics.len() {
-                let scope_keep = &keep[scope_idx];
+                let scope_keep: &[bool] = keep.get(scope_idx).map_or(&[], Vec::as_slice);
                 scope_idx += 1;
                 if let Some(metrics) = scope_metrics[j]
                     .get_mut("metrics")
@@ -107,7 +112,7 @@ pub(super) async fn evaluate_metrics_envelope(
                 {
                     let mut m = 0;
                     metrics.retain(|_| {
-                        let k = scope_keep[m];
+                        let k = scope_keep.get(m).copied().unwrap_or(true);
                         m += 1;
                         k
                     });
@@ -120,11 +125,7 @@ pub(super) async fn evaluate_metrics_envelope(
             }
         }
 
-        let prune_rm = resource_metrics[i]
-            .get("scopeMetrics")
-            .and_then(Value::as_array)
-            .map(<[Value]>::is_empty)
-            .unwrap_or(true);
+        let prune_rm = array_field_is_empty(&resource_metrics[i], "scopeMetrics");
         if prune_rm {
             resource_metrics.remove(i);
         } else {

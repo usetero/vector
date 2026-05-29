@@ -74,6 +74,20 @@ pub struct PolicyConfig {
 }
 
 /// Iteration mode for the `policy` transform.
+///
+/// NOTE: the two modes intentionally use different matching semantics, because
+/// they target different data models — `flat` wraps Vector's schema-less
+/// `LogEvent`, while `otel` follows the OTLP/JSON spec exactly (matching the
+/// `policy-rs` conformance suite). Two differences are worth knowing when
+/// moving a policy between modes:
+///
+/// * Non-string values: in `flat` mode an integer/float/boolean attribute is
+///   stringified and is therefore matchable (and redactable); in `otel` mode
+///   only a `stringValue` is matchable — other `AnyValue` variants satisfy
+///   `exists` but never a regex/exact match.
+/// * Empty values: `otel` mode treats an empty string / valueless `AnyValue`
+///   as absent (a `""` body does not `exist`); `flat` mode treats any present
+///   value as present.
 #[configurable_component]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

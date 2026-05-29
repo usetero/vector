@@ -38,7 +38,7 @@ use policy_rs::{
 };
 use vector_lib::event::{LogEvent, ObjectMap, Value};
 
-use super::internal_events::{DropCounts, DropReason};
+use super::internal_events::{DropCounts, DropReason, EvalErrors};
 
 /// Iterate every record inside an OTLP envelope event, applying policies
 /// per-record. Returns `Some(log)` to forward (with mutated and possibly
@@ -60,15 +60,14 @@ pub(super) async fn evaluate_envelope(
     };
 
     let mut drops = DropCounts::default();
+    let mut errors = EvalErrors::default();
     let mut i = 0;
     while i < resource_logs.len() {
-        // Lift `resource` out of the entry so the adapter can hold a mutable
-        // borrow of it alongside the mutable borrow of `scopeLogs` we take
-        // below (the borrow checker can't prove those paths are disjoint).
-        // It is re-inserted after all records under this resource are done.
-        let mut resource = resource_logs[i]
-            .as_object_mut()
-            .and_then(|o| o.remove("resource"));
+        // Lift `resource`/`scope` out (a move, not a clone) so the adapter can
+        // mutate them alongside the mutable borrow of the records array (the
+        // borrow checker can't prove those sibling paths are disjoint). They
+        // are re-attached after the records under them are processed.
+        let mut resource = lift_child(&mut resource_logs[i], "resource");
         let resource_schema_url = resource_logs[i].get("schemaUrl").cloned();
 
         let mut prune_this_rl = false;
@@ -79,10 +78,7 @@ pub(super) async fn evaluate_envelope(
         {
             let mut j = 0;
             while j < scope_logs.len() {
-                // Same trick for `scope`.
-                let mut scope = scope_logs[j]
-                    .as_object_mut()
-                    .and_then(|o| o.remove("scope"));
+                let mut scope = lift_child(&mut scope_logs[j], "scope");
                 let scope_schema_url = scope_logs[j].get("schemaUrl").cloned();
 
                 let mut prune_this_sl = false;
@@ -94,13 +90,13 @@ pub(super) async fn evaluate_envelope(
                     let mut k = 0;
                     while k < records.len() {
                         let result = {
-                            let mut adapter = OtlpLogAdapter::new(
-                                &mut records[k],
-                                resource.as_mut(),
-                                scope.as_mut(),
-                                resource_schema_url.as_ref(),
-                                scope_schema_url.as_ref(),
-                            );
+                            let mut adapter = OtlpLogAdapter {
+                                log_record: &mut records[k],
+                                resource: resource.as_mut(),
+                                scope: scope.as_mut(),
+                                resource_schema_url: resource_schema_url.as_ref(),
+                                scope_schema_url: scope_schema_url.as_ref(),
+                            };
                             engine.evaluate_and_transform(snapshot, &mut adapter).await
                         };
 
@@ -124,10 +120,7 @@ pub(super) async fn evaluate_envelope(
                                 drops.record(DropReason::RateLimited);
                             }
                             Err(error) => {
-                                error!(
-                                    message = "Policy evaluation failed; OTLP record passed through unchanged.",
-                                    %error,
-                                );
+                                errors.record(&error);
                                 k += 1;
                             }
                         }
@@ -135,11 +128,12 @@ pub(super) async fn evaluate_envelope(
                     prune_this_sl = records.is_empty();
                 }
 
-                // Re-attach the (possibly mutated) scope.
-                if let Some(scope) = scope
-                    && let Some(obj) = scope_logs[j].as_object_mut()
+                // Re-attach scope only if the entry survives (otherwise it's
+                // about to be pruned, so re-inserting would be wasted work).
+                if !prune_this_sl
+                    && let Some(scope) = scope
                 {
-                    obj.insert("scope".into(), scope);
+                    reattach_child(&mut scope_logs[j], "scope", scope);
                 }
 
                 if prune_this_sl {
@@ -151,11 +145,10 @@ pub(super) async fn evaluate_envelope(
             prune_this_rl = scope_logs.is_empty();
         }
 
-        // Re-attach the (possibly mutated) resource.
-        if let Some(resource) = resource
-            && let Some(obj) = resource_logs[i].as_object_mut()
+        if !prune_this_rl
+            && let Some(resource) = resource
         {
-            obj.insert("resource".into(), resource);
+            reattach_child(&mut resource_logs[i], "resource", resource);
         }
 
         if prune_this_rl {
@@ -166,6 +159,7 @@ pub(super) async fn evaluate_envelope(
     }
 
     drops.emit();
+    errors.emit();
 
     if resource_logs.is_empty() {
         None
@@ -185,6 +179,10 @@ pub(super) struct OtlpLogAdapter<'a> {
 }
 
 impl<'a> OtlpLogAdapter<'a> {
+    /// Test-only positional constructor. Production code builds the adapter
+    /// with a struct literal (see `evaluate_envelope`) so the four same-typed
+    /// optional borrows can't be transposed silently.
+    #[cfg(test)]
     pub(super) fn new(
         log_record: &'a mut Value,
         resource: Option<&'a mut Value>,
@@ -619,6 +617,35 @@ fn insert_simple_string(record: &mut Value, key: &str, value: &str) {
     if let Some(obj) = record.as_object_mut() {
         obj.insert(key.into(), Value::from(value.to_string()));
     }
+}
+
+// =============================================================================
+// Envelope-iteration helpers shared by the log / metric / trace adapters.
+// =============================================================================
+
+/// Remove an object child by key and return it (a move, not a clone). Used to
+/// lift `resource` / `scope` out of an envelope entry so they can be borrowed
+/// alongside a mutable borrow of a sibling array.
+pub(super) fn lift_child(entry: &mut Value, key: &str) -> Option<Value> {
+    entry.as_object_mut().and_then(|o| o.remove(key))
+}
+
+/// Re-attach a previously [`lift_child`]ed value under `key`.
+pub(super) fn reattach_child(entry: &mut Value, key: &str, child: Value) {
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert(key.into(), child);
+    }
+}
+
+/// Whether `entry`'s array field at `key` is empty or absent — i.e. the entry
+/// should be pruned from its parent.
+pub(super) fn array_field_is_empty(entry: &Value, key: &str) -> bool {
+    entry
+        .as_object()
+        .and_then(|o| o.get(key))
+        .and_then(Value::as_array)
+        .map(|a| a.is_empty())
+        .unwrap_or(true)
 }
 
 #[cfg(test)]

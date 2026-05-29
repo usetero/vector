@@ -2182,3 +2182,88 @@ async fn otel_mode_traces_sampling_writes_tracestate() {
     drop(tx);
     topology.stop().await;
 }
+
+// --- Envelope edge cases (guard the two-phase / lift hardening) -------------
+
+#[tokio::test]
+async fn otel_mode_metrics_scope_without_metrics_key_passes_through() {
+    let policies = write_policies(OTEL_POLICY_DROP_METRIC_BY_NAME);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    // One scope has no `metrics` array at all (empty decision row in the
+    // two-phase pass); it must survive untouched rather than panic or prune.
+    let envelope = Event::from_json_value(
+        json!({
+            "resourceMetrics": [{
+                "scopeMetrics": [
+                    { "scope": { "name": "no-metrics" } },
+                    { "scope": { "name": "has-metrics" }, "metrics": [
+                        { "name": "http.requests", "gauge": { "dataPoints": [{ "attributes": [] }] } }
+                    ]}
+                ]
+            }]
+        }),
+        LogNamespace::Legacy,
+    )
+    .unwrap();
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("envelope forwarded");
+    let log = received.into_log();
+    let scope_metrics = log
+        .get("resourceMetrics")
+        .and_then(|v| v.as_array())
+        .and_then(|rm| rm.first())
+        .and_then(|rm| rm.get("scopeMetrics"))
+        .and_then(|v| v.as_array())
+        .expect("scopeMetrics present");
+    assert_eq!(scope_metrics.len(), 2, "the metrics-less scope must survive");
+
+    drop(tx);
+    topology.stop().await;
+}
+
+#[tokio::test]
+async fn otel_mode_traces_without_resource_or_scope() {
+    let policies = write_policies(OTEL_POLICY_DROP_TRACE_BY_NAME);
+    let (tx, mut out, topology) = build_topology(policy_config_otel(policies.path())).await;
+
+    // No `resource` / `scope` objects: `lift_child` returns `None`. A kept span
+    // must survive, and the absent resource must not be synthesized on output.
+    let envelope = otlp_trace(json!({
+        "resourceSpans": [{
+            "scopeSpans": [{
+                "spans": [ { "name": "keep-me", "spanId": "a", "traceId": "t" } ]
+            }]
+        }]
+    }));
+    tx.send(envelope).await.unwrap();
+
+    let received = recv(&mut out).await.expect("trace forwarded");
+    let first_rs = received
+        .as_trace()
+        .get("resourceSpans")
+        .and_then(|v| v.as_array())
+        .and_then(|rs| rs.first())
+        .cloned()
+        .expect("resourceSpans present");
+    assert!(
+        first_rs.get("resource").is_none(),
+        "absent resource must not be synthesized",
+    );
+    let spans = first_rs
+        .get("scopeSpans")
+        .and_then(|v| v.as_array())
+        .and_then(|ss| ss.first())
+        .and_then(|ss| ss.get("spans"))
+        .and_then(|v| v.as_array())
+        .expect("spans present");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].get("name").and_then(|n| n.as_str()).as_deref(),
+        Some("keep-me"),
+    );
+
+    drop(tx);
+    topology.stop().await;
+}

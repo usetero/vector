@@ -71,7 +71,7 @@ fn hex_encode(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn hex_decode(bytes: &[u8]) -> Option<Vec<u8>> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let nibble = |c: u8| -> Option<u8> {

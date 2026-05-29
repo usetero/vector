@@ -66,7 +66,7 @@ fn value_path<'m>(
     }
 }
 
-fn simple_value_path(mapping: &FieldMapping, field: LogField) -> Option<&OwnedValuePath> {
+const fn simple_value_path(mapping: &FieldMapping, field: LogField) -> Option<&OwnedValuePath> {
     Some(match field {
         LogField::Body => &mapping.body.0,
         LogField::SeverityText => &mapping.severity_text.0,
