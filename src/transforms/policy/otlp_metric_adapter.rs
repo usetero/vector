@@ -22,7 +22,7 @@ use policy_rs::{
 use vector_lib::event::{LogEvent, Value};
 
 use super::internal_events::{DropReason, emit_dropped};
-use super::otlp_adapter::{
+use super::otlp_common::{
     array_field_is_empty, attribute_exists_path, find_attribute_path, non_empty,
 };
 

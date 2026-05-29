@@ -21,7 +21,7 @@ use policy_rs::{
 use vector_lib::event::{TraceEvent, Value};
 
 use super::internal_events::{DropCounts, DropReason, EvalErrors};
-use super::otlp_adapter::{
+use super::otlp_common::{
     attribute_exists_path, find_attribute_path, lift_child, non_empty, reattach_child,
 };
 

@@ -14,7 +14,7 @@ use super::adapter::VectorLogAdapter;
 use super::config::PolicyMode;
 use super::field_mapping::FieldMapping;
 use super::internal_events::{DropReason, emit_dropped};
-use super::otlp_adapter::evaluate_envelope;
+use super::otlp_log_adapter::evaluate_logs_envelope;
 use super::otlp_metric_adapter::evaluate_metrics_envelope;
 use super::otlp_trace_adapter::evaluate_traces_envelope;
 
@@ -80,7 +80,7 @@ impl TaskTransform<Event> for Policy {
                                 evaluate_metrics_envelope(&engine, &snapshot, log).await
                             }
                             PolicyMode::Otel => {
-                                evaluate_envelope(&engine, &snapshot, log).await
+                                evaluate_logs_envelope(&engine, &snapshot, log).await
                             }
                         };
                         if let Some(forwarded) = outcome {

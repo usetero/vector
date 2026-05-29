@@ -39,6 +39,10 @@ use policy_rs::{
 use vector_lib::event::{LogEvent, ObjectMap, Value};
 
 use super::internal_events::{DropCounts, DropReason, EvalErrors};
+use super::otlp_common::{
+    any_value_string, attribute_exists_path, attribute_key_eq, find_attribute_path, lift_child,
+    non_empty, reattach_child,
+};
 
 /// Iterate every record inside an OTLP envelope event, applying policies
 /// per-record. Returns `Some(log)` to forward (with mutated and possibly
@@ -49,7 +53,7 @@ use super::internal_events::{DropCounts, DropReason, EvalErrors};
 /// not an array), the event is forwarded unchanged so users who
 /// accidentally send non-envelope events through an `otel`-mode transform
 /// don't lose data silently.
-pub(super) async fn evaluate_envelope(
+pub(super) async fn evaluate_logs_envelope(
     engine: &PolicyEngine,
     snapshot: &PolicySnapshot,
     mut log: LogEvent,
@@ -180,7 +184,7 @@ pub(super) struct OtlpLogAdapter<'a> {
 
 impl<'a> OtlpLogAdapter<'a> {
     /// Test-only positional constructor. Production code builds the adapter
-    /// with a struct literal (see `evaluate_envelope`) so the four same-typed
+    /// with a struct literal (see `evaluate_logs_envelope`) so the four same-typed
     /// optional borrows can't be transposed silently.
     #[cfg(test)]
     pub(super) fn new(
@@ -400,38 +404,8 @@ impl Transformable for OtlpLogAdapter<'_> {
 }
 
 // =============================================================================
-// AnyValue helpers.
+// Log-record `body` presence (log-specific `AnyValue` semantics).
 // =============================================================================
-
-/// Coerce an OTLP `AnyValue` to a string for matching. Only a non-empty
-/// `stringValue` is matchable; all other variants (`intValue`, `boolValue`,
-/// `arrayValue`, …) return `None` so string matchers and regex redaction
-/// never operate on them.
-fn any_value_string(value: Option<&Value>) -> Option<Cow<'_, str>> {
-    let obj = value?.as_object()?;
-    match obj.get("stringValue").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => Some(s),
-        _ => None,
-    }
-}
-
-/// Whether an `AnyValue` carries any value variant at all. Powers
-/// `exists: true` matchers for attributes whose value isn't a string.
-fn any_value_present(value: Option<&Value>) -> bool {
-    const VARIANTS: [&str; 7] = [
-        "stringValue",
-        "boolValue",
-        "intValue",
-        "doubleValue",
-        "arrayValue",
-        "kvlistValue",
-        "bytesValue",
-    ];
-    match value.and_then(Value::as_object) {
-        Some(obj) => VARIANTS.iter().any(|k| obj.get(*k).is_some()),
-        None => false,
-    }
-}
 
 /// Presence semantics for the `body` field: an empty `stringValue` counts as
 /// missing, but any other present variant counts as present.
@@ -445,88 +419,6 @@ fn log_body_present(value: Option<&Value>) -> bool {
     ["boolValue", "intValue", "doubleValue", "arrayValue", "kvlistValue", "bytesValue"]
         .iter()
         .any(|k| obj.get(*k).is_some())
-}
-
-/// Coerce a plain string `Value` to a non-empty string. Empty strings count
-/// as absent, matching the reference adapter's `non_empty` helper.
-pub(super) fn non_empty(value: Option<&Value>) -> Option<Cow<'_, str>> {
-    match value?.as_str() {
-        Some(s) if !s.is_empty() => Some(s),
-        _ => None,
-    }
-}
-
-// =============================================================================
-// Attribute lookup (walks nested kvlistValue).
-// =============================================================================
-
-pub(super) fn find_attribute_path<'a>(
-    attrs: Option<&'a Value>,
-    path: &[String],
-) -> Option<Cow<'a, str>> {
-    let array = attrs?.as_array()?;
-    find_in_kvlist(array, path)
-}
-
-fn find_in_kvlist<'a>(attrs: &'a [Value], path: &[String]) -> Option<Cow<'a, str>> {
-    let first = path.first()?;
-    for kv in attrs {
-        if !attribute_key_eq(kv, first) {
-            continue;
-        }
-        let value = kv.as_object().and_then(|o| o.get("value"));
-        if path.len() == 1 {
-            return any_value_string(value);
-        }
-        return nested_values(value).and_then(|nested| find_in_kvlist(nested, &path[1..]));
-    }
-    None
-}
-
-pub(super) fn attribute_exists_path(attrs: Option<&Value>, path: &[String]) -> bool {
-    let Some(array) = attrs.and_then(Value::as_array) else {
-        return false;
-    };
-    exists_in_kvlist(array, path)
-}
-
-fn exists_in_kvlist(attrs: &[Value], path: &[String]) -> bool {
-    let Some(first) = path.first() else {
-        return false;
-    };
-    for kv in attrs {
-        if !attribute_key_eq(kv, first) {
-            continue;
-        }
-        let value = kv.as_object().and_then(|o| o.get("value"));
-        if path.len() == 1 {
-            return any_value_present(value);
-        }
-        return nested_values(value)
-            .map(|nested| exists_in_kvlist(nested, &path[1..]))
-            .unwrap_or(false);
-    }
-    false
-}
-
-/// Unwrap an `AnyValue`'s `kvlistValue.values` array.
-fn nested_values(value: Option<&Value>) -> Option<&[Value]> {
-    value
-        .and_then(Value::as_object)
-        .and_then(|o| o.get("kvlistValue"))
-        .and_then(Value::as_object)
-        .and_then(|o| o.get("values"))
-        .and_then(Value::as_array)
-}
-
-/// Whether an attribute entry's `key` equals `key`, comparing raw bytes so we
-/// skip UTF-8 validation on every entry of a linear scan (the key is an OTLP
-/// `string`, but for an equality test the byte representation is sufficient).
-fn attribute_key_eq(item: &Value, key: &str) -> bool {
-    matches!(
-        item.as_object().and_then(|o| o.get("key")),
-        Some(Value::Bytes(b)) if b.as_ref() == key.as_bytes()
-    )
 }
 
 // =============================================================================
@@ -617,35 +509,6 @@ fn insert_simple_string(record: &mut Value, key: &str, value: &str) {
     if let Some(obj) = record.as_object_mut() {
         obj.insert(key.into(), Value::from(value.to_string()));
     }
-}
-
-// =============================================================================
-// Envelope-iteration helpers shared by the log / metric / trace adapters.
-// =============================================================================
-
-/// Remove an object child by key and return it (a move, not a clone). Used to
-/// lift `resource` / `scope` out of an envelope entry so they can be borrowed
-/// alongside a mutable borrow of a sibling array.
-pub(super) fn lift_child(entry: &mut Value, key: &str) -> Option<Value> {
-    entry.as_object_mut().and_then(|o| o.remove(key))
-}
-
-/// Re-attach a previously [`lift_child`]ed value under `key`.
-pub(super) fn reattach_child(entry: &mut Value, key: &str, child: Value) {
-    if let Some(obj) = entry.as_object_mut() {
-        obj.insert(key.into(), child);
-    }
-}
-
-/// Whether `entry`'s array field at `key` is empty or absent — i.e. the entry
-/// should be pruned from its parent.
-pub(super) fn array_field_is_empty(entry: &Value, key: &str) -> bool {
-    entry
-        .as_object()
-        .and_then(|o| o.get(key))
-        .and_then(Value::as_array)
-        .map(|a| a.is_empty())
-        .unwrap_or(true)
 }
 
 #[cfg(test)]

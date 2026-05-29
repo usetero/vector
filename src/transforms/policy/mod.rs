@@ -9,7 +9,8 @@
 mod adapter;
 mod field_mapping;
 mod internal_events;
-mod otlp_adapter;
+mod otlp_common;
+mod otlp_log_adapter;
 mod otlp_metric_adapter;
 mod otlp_trace_adapter;
 
