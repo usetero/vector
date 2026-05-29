@@ -95,7 +95,8 @@ impl EvalErrors {
             return;
         }
         error!(
-            message = "Policy evaluation failed; affected OTLP records were passed through unchanged.",
+            message =
+                "Policy evaluation failed; affected OTLP records were passed through unchanged.",
             count = self.count,
             error = self.first.as_deref().unwrap_or_default(),
         );

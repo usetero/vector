@@ -134,9 +134,7 @@ pub(super) async fn evaluate_logs_envelope(
 
                 // Re-attach scope only if the entry survives (otherwise it's
                 // about to be pruned, so re-inserting would be wasted work).
-                if !prune_this_sl
-                    && let Some(scope) = scope
-                {
+                if !prune_this_sl && let Some(scope) = scope {
                     reattach_child(&mut scope_logs[j], "scope", scope);
                 }
 
@@ -149,9 +147,7 @@ pub(super) async fn evaluate_logs_envelope(
             prune_this_rl = scope_logs.is_empty();
         }
 
-        if !prune_this_rl
-            && let Some(resource) = resource
-        {
+        if !prune_this_rl && let Some(resource) = resource {
             reattach_child(&mut resource_logs[i], "resource", resource);
         }
 
@@ -207,10 +203,9 @@ impl<'a> OtlpLogAdapter<'a> {
     fn attributes_for(&self, selector: &LogFieldSelector) -> Option<&Value> {
         match selector {
             LogFieldSelector::LogAttribute(_) => self.log_record.get("attributes"),
-            LogFieldSelector::ResourceAttribute(_) => self
-                .resource
-                .as_deref()
-                .and_then(|r| r.get("attributes")),
+            LogFieldSelector::ResourceAttribute(_) => {
+                self.resource.as_deref().and_then(|r| r.get("attributes"))
+            }
             LogFieldSelector::ScopeAttribute(_) => {
                 self.scope.as_deref().and_then(|s| s.get("attributes"))
             }
@@ -416,9 +411,16 @@ fn log_body_present(value: Option<&Value>) -> bool {
     if let Some(s) = obj.get("stringValue").and_then(Value::as_str) {
         return !s.is_empty();
     }
-    ["boolValue", "intValue", "doubleValue", "arrayValue", "kvlistValue", "bytesValue"]
-        .iter()
-        .any(|k| obj.get(*k).is_some())
+    [
+        "boolValue",
+        "intValue",
+        "doubleValue",
+        "arrayValue",
+        "kvlistValue",
+        "bytesValue",
+    ]
+    .iter()
+    .any(|k| obj.get(*k).is_some())
 }
 
 // =============================================================================
@@ -569,7 +571,10 @@ mod tests {
         let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
         // get_field must return None (not "42") so a regex redact won't fire.
         assert_eq!(
-            get(&adapter, LogFieldSelector::LogAttribute(vec!["count".into()])),
+            get(
+                &adapter,
+                LogFieldSelector::LogAttribute(vec!["count".into()])
+            ),
             None
         );
         // but exists: true must still match.
@@ -619,7 +624,10 @@ mod tests {
         let mut record = Value::Object(ObjectMap::new());
         {
             let mut adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
-            adapter.set_field(&LogFieldSelector::Simple(LogField::Body), "[no body provided]");
+            adapter.set_field(
+                &LogFieldSelector::Simple(LogField::Body),
+                "[no body provided]",
+            );
         }
         let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
         assert_eq!(
@@ -685,8 +693,7 @@ mod tests {
             ("old", make_string_any_value("val")),
         ]);
         {
-            let mut adapter =
-                OtlpLogAdapter::new(&mut record, None, Some(&mut scope), None, None);
+            let mut adapter = OtlpLogAdapter::new(&mut record, None, Some(&mut scope), None, None);
             assert!(adapter.delete_field(&LogFieldSelector::ScopeAttribute(vec!["secret".into()])));
             adapter.move_field(
                 &LogFieldSelector::ScopeAttribute(vec!["old".into()]),
@@ -694,10 +701,25 @@ mod tests {
             );
         }
         let adapter = OtlpLogAdapter::new(&mut record, None, Some(&mut scope), None, None);
-        assert!(get(&adapter, LogFieldSelector::ScopeAttribute(vec!["secret".into()])).is_none());
-        assert!(get(&adapter, LogFieldSelector::ScopeAttribute(vec!["old".into()])).is_none());
+        assert!(
+            get(
+                &adapter,
+                LogFieldSelector::ScopeAttribute(vec!["secret".into()])
+            )
+            .is_none()
+        );
+        assert!(
+            get(
+                &adapter,
+                LogFieldSelector::ScopeAttribute(vec!["old".into()])
+            )
+            .is_none()
+        );
         assert_eq!(
-            get(&adapter, LogFieldSelector::ScopeAttribute(vec!["new".into()])),
+            get(
+                &adapter,
+                LogFieldSelector::ScopeAttribute(vec!["new".into()])
+            ),
             Some("val".to_string())
         );
     }

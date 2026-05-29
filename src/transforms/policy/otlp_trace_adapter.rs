@@ -107,9 +107,7 @@ pub(super) async fn evaluate_traces_envelope(
                 }
 
                 // Re-attach scope only if the entry survives.
-                if !prune_ss
-                    && let Some(scope) = scope
-                {
+                if !prune_ss && let Some(scope) = scope {
                     reattach_child(&mut scope_spans[j], "scope", scope);
                 }
 
@@ -122,9 +120,7 @@ pub(super) async fn evaluate_traces_envelope(
             prune_rs = scope_spans.is_empty();
         }
 
-        if !prune_rs
-            && let Some(resource) = resource
-        {
+        if !prune_rs && let Some(resource) = resource {
             reattach_child(&mut resource_spans[i], "resource", resource);
         }
 
@@ -187,9 +183,7 @@ impl TraceAdapter<'_> {
         match status.get("code").and_then(Value::as_str).as_deref() {
             Some("STATUS_CODE_OK") => Some(Cow::Borrowed("SPAN_STATUS_CODE_OK")),
             Some("STATUS_CODE_ERROR") => Some(Cow::Borrowed("SPAN_STATUS_CODE_ERROR")),
-            Some("STATUS_CODE_UNSET") | None => {
-                Some(Cow::Borrowed("SPAN_STATUS_CODE_UNSPECIFIED"))
-            }
+            Some("STATUS_CODE_UNSET") | None => Some(Cow::Borrowed("SPAN_STATUS_CODE_UNSPECIFIED")),
             Some(_) => None,
         }
     }
@@ -369,7 +363,10 @@ mod tests {
             Some("GET /x".to_string()),
         );
         assert_eq!(
-            get(span.clone(), TraceFieldSelector::Simple(TraceField::TraceId)),
+            get(
+                span.clone(),
+                TraceFieldSelector::Simple(TraceField::TraceId)
+            ),
             Some("abc".to_string()),
         );
         assert_eq!(
@@ -429,7 +426,10 @@ mod tests {
             get(json!({"status": {}}), TraceFieldSelector::SpanStatus),
             Some("SPAN_STATUS_CODE_UNSPECIFIED".to_string()),
         );
-        assert!(exists(json!({"status": {}}), &TraceFieldSelector::SpanStatus));
+        assert!(exists(
+            json!({"status": {}}),
+            &TraceFieldSelector::SpanStatus
+        ));
     }
 
     #[test]

@@ -51,4 +51,5 @@ ignore = [
   { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102/0.101 CRL parsing panic - tonic upgrade (https://github.com/vectordotdev/vector/issues/19179); 0.103 already patched to 0.103.13" },
   { id = "RUSTSEC-2026-0105", reason = "core2 is unmaintained and all versions yanked - transitive dependency via libflate -> apache-avro, no safe upgrade available" },
   { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.24 - unpatched crate (https://github.com/mongodb/mongo-rust-driver/pull/1682)" },
+  { id = "RUSTSEC-2024-0384", reason = "instant is unmaintained - transitive dependency via policy-rs -> notify 7 -> notify-types, no safe upgrade available upstream" },
 ]

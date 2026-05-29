@@ -216,7 +216,10 @@ impl Matchable for MetricAdapter<'_> {
             MetricFieldSelector::Type => self.data().map(|(_, ty)| Cow::Borrowed(ty)),
             MetricFieldSelector::Temporality => {
                 let (data, _) = self.data()?;
-                non_empty(data.as_object().and_then(|o| o.get("aggregationTemporality")))
+                non_empty(
+                    data.as_object()
+                        .and_then(|o| o.get("aggregationTemporality")),
+                )
             }
         }
     }
@@ -269,8 +272,14 @@ mod tests {
     #[test]
     fn metric_type_derived_from_data_variant() {
         let cases = [
-            (json!({"name": "m", "gauge": {"dataPoints": []}}), "METRIC_TYPE_GAUGE"),
-            (json!({"name": "m", "sum": {"dataPoints": []}}), "METRIC_TYPE_SUM"),
+            (
+                json!({"name": "m", "gauge": {"dataPoints": []}}),
+                "METRIC_TYPE_GAUGE",
+            ),
+            (
+                json!({"name": "m", "sum": {"dataPoints": []}}),
+                "METRIC_TYPE_SUM",
+            ),
             (
                 json!({"name": "m", "histogram": {"dataPoints": []}}),
                 "METRIC_TYPE_HISTOGRAM",

@@ -108,7 +108,9 @@ impl Transformable for VectorLogAdapter<'_> {
         let Some(path) = value_path(self.mapping, field) else {
             return false;
         };
-        self.log.remove((PathPrefix::Event, path.as_ref())).is_some()
+        self.log
+            .remove((PathPrefix::Event, path.as_ref()))
+            .is_some()
     }
 
     fn move_field(&mut self, from: &LogFieldSelector, to: &LogFieldSelector) {

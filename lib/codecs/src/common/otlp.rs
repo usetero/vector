@@ -95,12 +95,7 @@ mod tests {
     use vrl::value::Value;
 
     fn obj(pairs: Vec<(&str, Value)>) -> Value {
-        Value::Object(
-            pairs
-                .into_iter()
-                .map(|(k, v)| (k.into(), v))
-                .collect(),
-        )
+        Value::Object(pairs.into_iter().map(|(k, v)| (k.into(), v)).collect())
     }
 
     #[test]
@@ -160,7 +155,10 @@ mod tests {
             "attributes",
             Value::Array(vec![obj(vec![
                 ("key", Value::from("spanId")),
-                ("value", obj(vec![("stringValue", Value::from("not-an-id"))])),
+                (
+                    "value",
+                    obj(vec![("stringValue", Value::from("not-an-id"))]),
+                ),
             ])]),
         )]);
         let before = tree.clone();

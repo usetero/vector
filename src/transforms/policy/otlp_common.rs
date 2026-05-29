@@ -207,7 +207,10 @@ mod tests {
             Some("GET"),
         );
         // Missing top-level key, and a missing nested segment, both resolve to None.
-        assert_eq!(find_attribute_path(Some(&attrs), &["nope".to_string()]), None);
+        assert_eq!(
+            find_attribute_path(Some(&attrs), &["nope".to_string()]),
+            None
+        );
         assert_eq!(
             find_attribute_path(Some(&attrs), &["http".to_string(), "nope".to_string()]),
             None,
@@ -217,7 +220,10 @@ mod tests {
     #[test]
     fn find_attribute_path_non_string_leaf_is_none() {
         let attrs = v(json!([{"key": "count", "value": {"intValue": "42"}}]));
-        assert_eq!(find_attribute_path(Some(&attrs), &["count".to_string()]), None);
+        assert_eq!(
+            find_attribute_path(Some(&attrs), &["count".to_string()]),
+            None
+        );
     }
 
     #[test]
@@ -234,7 +240,10 @@ mod tests {
             Some(&attrs),
             &["http".to_string(), "method".to_string()]
         ));
-        assert!(!attribute_exists_path(Some(&attrs), &["missing".to_string()]));
+        assert!(!attribute_exists_path(
+            Some(&attrs),
+            &["missing".to_string()]
+        ));
         assert!(!attribute_exists_path(None, &["count".to_string()]));
     }
 

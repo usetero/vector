@@ -2217,7 +2217,11 @@ async fn otel_mode_metrics_scope_without_metrics_key_passes_through() {
         .and_then(|rm| rm.get("scopeMetrics"))
         .and_then(|v| v.as_array())
         .expect("scopeMetrics present");
-    assert_eq!(scope_metrics.len(), 2, "the metrics-less scope must survive");
+    assert_eq!(
+        scope_metrics.len(),
+        2,
+        "the metrics-less scope must survive"
+    );
 
     drop(tx);
     topology.stop().await;
