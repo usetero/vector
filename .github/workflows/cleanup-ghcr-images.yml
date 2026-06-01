@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   cleanup-vector-nightlies:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       packages: write # Required to delete package versions from GHCR
     steps:
@@ -31,7 +31,7 @@ jobs:
           ignore-versions: '^(nightly$|\d+\.\d+)'
 
   cleanup-test-runner:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       packages: write # Required to delete package versions from GHCR
     steps:

@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   release-please:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Don't fire in the upstream `vectordotdev/vector` repo if this fork's
     # `master` is ever pushed back upstream by accident.
     if: github.repository_owner == 'usetero'

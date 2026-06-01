@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
     outputs:
@@ -32,7 +32,7 @@ jobs:
   run-test-integration-windows:
     needs: changes
     if: needs.changes.outputs.windows == 'true'
-    runs-on: windows-2025-8core
+    runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 60
     steps:
       - name: Checkout branch
@@ -49,7 +49,7 @@ jobs:
 
   test-integration-windows:
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: run-test-integration-windows
     steps:
       - run: |
