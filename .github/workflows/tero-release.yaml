@@ -79,7 +79,7 @@ jobs:
             runner: ubuntu-24.04
             triple: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: arm-4-core
             triple: aarch64-unknown-linux-gnu
     steps:
       - name: Checkout
