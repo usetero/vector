@@ -3,11 +3,10 @@
   "packages": {
     ".": {
       "release-type": "rust",
+      "versioning": "prerelease",
       "prerelease": true,
-      "bump-minor-pre-major": false,
-      "bump-patch-for-minor-pre-major": false,
-      "draft": false,
       "prerelease-type": "tero",
+      "draft": false,
       "include-component-in-tag": false,
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
