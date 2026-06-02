@@ -1,6 +1,6 @@
 [package]
 name = "prometheus-parser"
-version = "1.0.0-tero.0"
+version = "0.56.0-tero.1"
 authors = ["Vector Contributors <vector@datadoghq.com>", "Duy Do <juchiast@gmail.com>"]
 edition = "2024"
 publish = false

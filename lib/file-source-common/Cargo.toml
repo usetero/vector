@@ -1,6 +1,6 @@
 [package]
 name = "file-source-common"
-version = "1.0.0-tero.0"
+version = "0.56.0-tero.1"
 authors = ["Vector Contributors <vector@datadoghq.com>", "Mark Story <mark@mark-story.com>"]
 edition = "2024"
 publish = false
