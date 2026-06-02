@@ -120,7 +120,11 @@ jobs:
           rustflags: ""
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        # Blacksmith's cache action keeps save/restore on their colocated
+        # network — roughly an order of magnitude faster than actions/cache@v4
+        # for multi-GB `target/` payloads and not subject to GitHub's 10 GB
+        # per-repo cache cap.
+        uses: useblacksmith/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
