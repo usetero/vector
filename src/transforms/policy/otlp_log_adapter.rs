@@ -101,7 +101,7 @@ pub(super) async fn evaluate_logs_envelope(
                                 resource_schema_url: resource_schema_url.as_ref(),
                                 scope_schema_url: scope_schema_url.as_ref(),
                             };
-                            engine.evaluate_and_transform(snapshot, &mut adapter).await
+                            engine.evaluate_and_transform(snapshot, &mut adapter)
                         };
 
                         match result {
@@ -183,7 +183,7 @@ impl<'a> OtlpLogAdapter<'a> {
     /// with a struct literal (see `evaluate_logs_envelope`) so the four same-typed
     /// optional borrows can't be transposed silently.
     #[cfg(test)]
-    pub(super) fn new(
+    pub(super) const fn new(
         log_record: &'a mut Value,
         resource: Option<&'a mut Value>,
         scope: Option<&'a mut Value>,

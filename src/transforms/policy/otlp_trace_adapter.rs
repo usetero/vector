@@ -78,7 +78,7 @@ pub(super) async fn evaluate_traces_envelope(
                                 resource_schema_url: resource_schema_url.as_ref(),
                                 scope_schema_url: scope_schema_url.as_ref(),
                             };
-                            engine.evaluate_trace(snapshot, &mut adapter).await
+                            engine.evaluate_trace(snapshot, &mut adapter)
                         };
 
                         let keep = match result {

@@ -76,7 +76,7 @@ pub(super) async fn evaluate_metrics_envelope(
                                 scope_schema_url,
                             };
                             let drop = matches!(
-                                engine.evaluate(snapshot, &adapter).await,
+                                engine.evaluate(snapshot, &adapter),
                                 Ok(EvaluateResult::Drop { .. })
                             );
                             if drop {

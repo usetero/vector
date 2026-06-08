@@ -121,7 +121,7 @@ async fn evaluate_flat(
 ) -> Option<LogEvent> {
     let result = {
         let mut adapter = VectorLogAdapter::new(&mut log, mapping);
-        engine.evaluate_and_transform(snapshot, &mut adapter).await
+        engine.evaluate_and_transform(snapshot, &mut adapter)
     };
     match result {
         Ok(EvaluateResult::NoMatch)

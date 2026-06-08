@@ -1,6 +1,7 @@
 //! Configuration for the `policy` transform.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use policy_rs::{
@@ -71,6 +72,39 @@ pub struct PolicyConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub field_mapping: FieldMapping,
+
+    /// Client identity advertised to every HTTP/gRPC policy provider.
+    ///
+    /// `resource_attributes` and `labels` are forwarded to each provider's
+    /// `ClientMetadata` on sync requests. When non-empty, the transform-level
+    /// value overrides anything the provider declared individually; per-provider
+    /// values are preserved only when the transform-level field is left empty.
+    /// File providers ignore this field — they don't sync against a server.
+    ///
+    /// Resource attribute keys typically follow OpenTelemetry semantic
+    /// conventions (`service.name`, `service.namespace`, `service.instance.id`,
+    /// `service.version`).
+    #[configurable(derived)]
+    #[serde(default)]
+    pub client_metadata: ClientMetadata,
+}
+
+/// Client identity passed to HTTP/gRPC policy providers on sync requests.
+#[configurable_component]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClientMetadata {
+    /// Resource attributes describing this Vector instance (e.g. `service.name`).
+    pub resource_attributes: HashMap<String, String>,
+
+    /// Free-form labels forwarded alongside the resource attributes.
+    pub labels: HashMap<String, String>,
+}
+
+impl ClientMetadata {
+    fn is_empty(&self) -> bool {
+        self.resource_attributes.is_empty() && self.labels.is_empty()
+    }
 }
 
 /// Iteration mode for the `policy` transform.
@@ -124,6 +158,7 @@ impl PolicyProviderConfig {
         Self(PolicyRsProviderConfig::File(FileProviderConfig {
             id: id.into(),
             path: path.into(),
+            poll_interval_secs: None,
         }))
     }
 
@@ -161,6 +196,7 @@ impl GenerateConfig for PolicyConfig {
             )],
             mode: PolicyMode::default(),
             field_mapping: FieldMapping::default(),
+            client_metadata: ClientMetadata::default(),
         })
         .unwrap()
     }
@@ -168,16 +204,44 @@ impl GenerateConfig for PolicyConfig {
 
 impl PolicyConfig {
     fn provider_configs(&self) -> crate::Result<Vec<PolicyRsProviderConfig>> {
-        if !self.policy_providers.is_empty() {
-            return Ok(self
-                .policy_providers
-                .iter()
-                .cloned()
-                .map(PolicyProviderConfig::into_inner)
-                .collect());
+        if self.policy_providers.is_empty() {
+            return Err("policy transform requires at least one policy provider".into());
         }
 
-        Err("policy transform requires at least one policy provider".into())
+        Ok(self
+            .policy_providers
+            .iter()
+            .cloned()
+            .map(PolicyProviderConfig::into_inner)
+            .map(|cfg| self.apply_client_metadata(cfg))
+            .collect())
+    }
+
+    fn apply_client_metadata(&self, cfg: PolicyRsProviderConfig) -> PolicyRsProviderConfig {
+        if self.client_metadata.is_empty() {
+            return cfg;
+        }
+        match cfg {
+            PolicyRsProviderConfig::Http(mut c) => {
+                if !self.client_metadata.resource_attributes.is_empty() {
+                    c.resource_attributes = self.client_metadata.resource_attributes.clone();
+                }
+                if !self.client_metadata.labels.is_empty() {
+                    c.labels = self.client_metadata.labels.clone();
+                }
+                PolicyRsProviderConfig::Http(c)
+            }
+            PolicyRsProviderConfig::Grpc(mut c) => {
+                if !self.client_metadata.resource_attributes.is_empty() {
+                    c.resource_attributes = self.client_metadata.resource_attributes.clone();
+                }
+                if !self.client_metadata.labels.is_empty() {
+                    c.labels = self.client_metadata.labels.clone();
+                }
+                PolicyRsProviderConfig::Grpc(c)
+            }
+            other => other,
+        }
     }
 }
 
@@ -351,5 +415,199 @@ path = "/dev/null"
             result.is_err(),
             "unknown provider `type` value should be rejected",
         );
+    }
+
+    // -- apply_client_metadata fan-out ----------------------------------
+
+    use policy_rs::config::{GrpcProviderConfig, HttpProviderConfig};
+
+    fn http(id: &str) -> HttpProviderConfig {
+        HttpProviderConfig {
+            id: id.into(),
+            url: "https://policy.example/sync".into(),
+            headers: Vec::new(),
+            poll_interval_secs: None,
+            content_type: None,
+            resource_attributes: HashMap::new(),
+            labels: HashMap::new(),
+        }
+    }
+
+    fn grpc(id: &str) -> GrpcProviderConfig {
+        GrpcProviderConfig {
+            id: id.into(),
+            url: "https://policy.example".into(),
+            headers: Vec::new(),
+            poll_interval_secs: None,
+            resource_attributes: HashMap::new(),
+            labels: HashMap::new(),
+        }
+    }
+
+    fn file(id: &str) -> FileProviderConfig {
+        FileProviderConfig {
+            id: id.into(),
+            path: "/tmp/p.json".into(),
+            poll_interval_secs: None,
+        }
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+    }
+
+    fn policy_config_with_metadata(client_metadata: ClientMetadata) -> PolicyConfig {
+        PolicyConfig {
+            policy_providers: Vec::new(),
+            mode: PolicyMode::Flat,
+            field_mapping: FieldMapping::default(),
+            client_metadata,
+        }
+    }
+
+    #[test]
+    fn apply_client_metadata_empty_is_noop() {
+        let cfg = policy_config_with_metadata(ClientMetadata::default());
+        let original = http("h");
+        let PolicyRsProviderConfig::Http(out) =
+            cfg.apply_client_metadata(PolicyRsProviderConfig::Http(original.clone()))
+        else {
+            panic!("expected Http variant");
+        };
+        assert!(out.resource_attributes.is_empty());
+        assert!(out.labels.is_empty());
+    }
+
+    #[test]
+    fn apply_client_metadata_fans_into_http() {
+        let cfg = policy_config_with_metadata(ClientMetadata {
+            resource_attributes: map(&[("service.name", "vector")]),
+            labels: map(&[("env", "prod")]),
+        });
+        let PolicyRsProviderConfig::Http(out) =
+            cfg.apply_client_metadata(PolicyRsProviderConfig::Http(http("h")))
+        else {
+            panic!("expected Http variant");
+        };
+        assert_eq!(out.resource_attributes, map(&[("service.name", "vector")]));
+        assert_eq!(out.labels, map(&[("env", "prod")]));
+    }
+
+    #[test]
+    fn apply_client_metadata_fans_into_grpc() {
+        let cfg = policy_config_with_metadata(ClientMetadata {
+            resource_attributes: map(&[("service.instance.id", "host-1")]),
+            labels: map(&[("team", "platform")]),
+        });
+        let PolicyRsProviderConfig::Grpc(out) =
+            cfg.apply_client_metadata(PolicyRsProviderConfig::Grpc(grpc("g")))
+        else {
+            panic!("expected Grpc variant");
+        };
+        assert_eq!(
+            out.resource_attributes,
+            map(&[("service.instance.id", "host-1")])
+        );
+        assert_eq!(out.labels, map(&[("team", "platform")]));
+    }
+
+    #[test]
+    fn apply_client_metadata_leaves_file_provider_untouched() {
+        // File providers have no resource_attributes/labels — the helper must
+        // pass them through unchanged even when client_metadata is set.
+        let cfg = policy_config_with_metadata(ClientMetadata {
+            resource_attributes: map(&[("service.name", "vector")]),
+            labels: HashMap::new(),
+        });
+        let PolicyRsProviderConfig::File(out) =
+            cfg.apply_client_metadata(PolicyRsProviderConfig::File(file("f")))
+        else {
+            panic!("expected File variant");
+        };
+        assert_eq!(out.id, "f");
+        assert_eq!(out.path, "/tmp/p.json");
+    }
+
+    #[test]
+    fn apply_client_metadata_overrides_per_provider_values() {
+        // Transform-level values win over anything the provider declared
+        // individually when the transform-level field is non-empty.
+        let cfg = policy_config_with_metadata(ClientMetadata {
+            resource_attributes: map(&[("service.name", "vector")]),
+            labels: map(&[("env", "prod")]),
+        });
+        let mut provider = http("h");
+        provider.resource_attributes = map(&[("service.name", "stale"), ("svc.ver", "1")]);
+        provider.labels = map(&[("env", "stale")]);
+
+        let PolicyRsProviderConfig::Http(out) =
+            cfg.apply_client_metadata(PolicyRsProviderConfig::Http(provider))
+        else {
+            panic!("expected Http variant");
+        };
+        assert_eq!(out.resource_attributes, map(&[("service.name", "vector")]));
+        assert_eq!(out.labels, map(&[("env", "prod")]));
+    }
+
+    #[test]
+    fn apply_client_metadata_preserves_per_provider_when_transform_map_empty() {
+        // Only the non-empty transform-level map overrides — the other side
+        // keeps whatever the provider already had. Lets you set, e.g.,
+        // resource_attributes transform-wide while keeping labels per-provider.
+        let cfg = policy_config_with_metadata(ClientMetadata {
+            resource_attributes: map(&[("service.name", "vector")]),
+            labels: HashMap::new(),
+        });
+        let mut provider = http("h");
+        provider.labels = map(&[("env", "kept")]);
+
+        let PolicyRsProviderConfig::Http(out) =
+            cfg.apply_client_metadata(PolicyRsProviderConfig::Http(provider))
+        else {
+            panic!("expected Http variant");
+        };
+        assert_eq!(out.resource_attributes, map(&[("service.name", "vector")]));
+        assert_eq!(out.labels, map(&[("env", "kept")]));
+    }
+
+    #[test]
+    fn provider_configs_fans_metadata_end_to_end() {
+        // Drives the full deserialize → provider_configs pipeline so the
+        // fan-out is exercised through the same path TransformConfig::build
+        // would take at runtime.
+        let config: PolicyConfig = toml::from_str(
+            r#"
+[[policy_providers]]
+type = "http"
+id = "remote"
+url = "https://policy.example/sync"
+
+[[policy_providers]]
+type = "file"
+id = "local"
+path = "/tmp/p.json"
+
+[client_metadata.resource_attributes]
+"service.name" = "vector"
+"service.instance.id" = "pod-1"
+"#,
+        )
+        .unwrap();
+
+        let providers = config.provider_configs().unwrap();
+        assert_eq!(providers.len(), 2);
+
+        let PolicyRsProviderConfig::Http(http_cfg) = &providers[0] else {
+            panic!("first provider should be Http");
+        };
+        assert_eq!(
+            http_cfg.resource_attributes,
+            map(&[("service.name", "vector"), ("service.instance.id", "pod-1")])
+        );
+        // labels weren't set, so they stay empty.
+        assert!(http_cfg.labels.is_empty());
+
+        // File provider was passed through untouched.
+        assert!(matches!(&providers[1], PolicyRsProviderConfig::File(_)));
     }
 }
