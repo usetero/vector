@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.56.0-tero.2](https://github.com/usetero/vector/compare/v0.56.0-tero.1...v0.56.0-tero.2) (2026-06-10)
+
+
+### Features
+
+* bump to policy-rs 1.7.0 ([#12](https://github.com/usetero/vector/issues/12)) ([bb2f986](https://github.com/usetero/vector/commit/bb2f9867d4c72c07f66797e7f57a4bc2b7d9817b))
+
 ## [0.56.0-tero.1](https://github.com/usetero/vector/compare/v0.56.0-tero.0...v0.56.0-tero.1) (2026-06-02)
 
 

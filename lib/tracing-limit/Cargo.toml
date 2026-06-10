@@ -1,6 +1,6 @@
 [package]
 name = "tracing-limit"
-version = "0.56.0-tero.1"
+version = "0.56.0-tero.2"
 authors = ["Vector Contributors <vector@datadoghq.com>"]
 edition = "2024"
 publish = false
