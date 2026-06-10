@@ -16,13 +16,14 @@ use std::borrow::Cow;
 use policy_rs::proto::tero::policy::v1::TraceField;
 use policy_rs::{
     EvaluateResult, Matchable, PolicyEngine, PolicySnapshot, TraceFieldSelector, Transformable,
-    engine::TraceSignal,
+    engine::{TraceSignal, TypedValue},
 };
 use vector_lib::event::{TraceEvent, Value};
 
 use super::internal_events::{DropCounts, DropReason, EvalErrors};
 use super::otlp_common::{
-    attribute_exists_path, find_attribute_path, lift_child, non_empty, reattach_child,
+    attribute_exists_path, find_attribute_path, find_attribute_typed_path, lift_child, non_empty,
+    reattach_child,
 };
 
 /// Iterate every span in an OTLP traces envelope, sampling/dropping in place.
@@ -78,7 +79,7 @@ pub(super) async fn evaluate_traces_envelope(
                                 resource_schema_url: resource_schema_url.as_ref(),
                                 scope_schema_url: scope_schema_url.as_ref(),
                             };
-                            engine.evaluate_trace(snapshot, &mut adapter).await
+                            engine.evaluate_trace(snapshot, &mut adapter)
                         };
 
                         let keep = match result {
@@ -247,6 +248,21 @@ impl Matchable for TraceAdapter<'_> {
                 attribute_exists_path(self.scope_attributes(), path)
             }
             _ => self.get_field(field).is_some(),
+        }
+    }
+
+    fn get_typed_value(&self, field: &TraceFieldSelector) -> Option<TypedValue<'_>> {
+        match field {
+            TraceFieldSelector::SpanAttribute(path) => {
+                find_attribute_typed_path(self.span_attributes(), path)
+            }
+            TraceFieldSelector::ResourceAttribute(path) => {
+                find_attribute_typed_path(self.resource_attributes(), path)
+            }
+            TraceFieldSelector::ScopeAttribute(path) => {
+                find_attribute_typed_path(self.scope_attributes(), path)
+            }
+            _ => self.get_field(field).map(TypedValue::String),
         }
     }
 }
@@ -541,5 +557,24 @@ mod tests {
         assert_eq!(merge_ot_tracestate("foo=bar", "th:8"), "ot=th:8,foo=bar");
         // An existing `th` is overwritten, not duplicated.
         assert_eq!(merge_ot_tracestate("ot=th:4", "th:8"), "ot=th:8");
+    }
+
+    #[test]
+    fn typed_value_surfaces_int_span_attribute() {
+        let mut span =
+            val(json!({"attributes": [{"key": "http.status_code", "value": {"intValue": "500"}}]}));
+        let adapter = TraceAdapter {
+            span: &mut span,
+            resource: None,
+            scope: None,
+            resource_schema_url: None,
+            scope_schema_url: None,
+        };
+        assert!(matches!(
+            adapter.get_typed_value(&TraceFieldSelector::SpanAttribute(vec![
+                "http.status_code".to_string()
+            ])),
+            Some(TypedValue::Int(500)),
+        ));
     }
 }

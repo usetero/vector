@@ -20,7 +20,7 @@ use crate::event::{Event, Value};
 use crate::test_util::components::init_test;
 use crate::transforms::test::create_topology;
 
-use super::config::{PolicyConfig, PolicyMode, PolicyProviderConfig};
+use super::config::{ClientMetadata, PolicyConfig, PolicyMode, PolicyProviderConfig};
 use super::field_mapping::FieldMapping;
 
 /// Write `body` to a fresh NamedTempFile with the `.json` suffix and return
@@ -45,6 +45,7 @@ fn policy_config(path: &Path) -> PolicyConfig {
         )],
         mode: PolicyMode::Flat,
         field_mapping: FieldMapping::default(),
+        client_metadata: ClientMetadata::default(),
     }
 }
 
@@ -57,6 +58,7 @@ fn policy_config_otel(path: &Path) -> PolicyConfig {
         )],
         mode: PolicyMode::Otel,
         field_mapping: FieldMapping::default(),
+        client_metadata: ClientMetadata::default(),
     }
 }
 
