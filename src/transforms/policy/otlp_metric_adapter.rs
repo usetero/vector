@@ -17,13 +17,14 @@ use std::borrow::Cow;
 use policy_rs::proto::tero::policy::v1::MetricField;
 use policy_rs::{
     EvaluateResult, Matchable, MetricFieldSelector, PolicyEngine, PolicySnapshot,
-    engine::MetricSignal,
+    engine::{MetricSignal, TypedValue},
 };
 use vector_lib::event::{LogEvent, Value};
 
 use super::internal_events::{DropReason, emit_dropped};
 use super::otlp_common::{
-    array_field_is_empty, attribute_exists_path, find_attribute_path, non_empty,
+    array_field_is_empty, attribute_exists_path, find_attribute_path, find_attribute_typed_path,
+    non_empty,
 };
 
 /// Data-variant keys of an OTLP `Metric` (proto3 JSON), paired with the
@@ -238,6 +239,21 @@ impl Matchable for MetricAdapter<'_> {
             _ => self.get_field(field).is_some(),
         }
     }
+
+    fn get_typed_value(&self, field: &MetricFieldSelector) -> Option<TypedValue<'_>> {
+        match field {
+            MetricFieldSelector::DatapointAttribute(path) => {
+                find_attribute_typed_path(self.first_datapoint_attributes(), path)
+            }
+            MetricFieldSelector::ResourceAttribute(path) => {
+                find_attribute_typed_path(self.resource_attributes(), path)
+            }
+            MetricFieldSelector::ScopeAttribute(path) => {
+                find_attribute_typed_path(self.scope_attributes(), path)
+            }
+            _ => self.get_field(field).map(TypedValue::String),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +379,20 @@ mod tests {
         assert_eq!(get(&m, sel.clone()), None);
         // ...but `exists` still fires.
         assert!(adapter(&m, None, None).field_exists(&sel));
+    }
+
+    #[test]
+    fn typed_value_surfaces_int_datapoint_attribute() {
+        // The same intValue that string get_field can't see must come back as
+        // TypedValue::Int via get_typed_value so numeric matchers fire.
+        let m = val(json!({"name": "m", "sum": {"dataPoints": [
+            {"attributes": [{"key": "count", "value": {"intValue": "42"}}]}
+        ]}}));
+        let sel = MetricFieldSelector::DatapointAttribute(vec!["count".to_string()]);
+        assert!(matches!(
+            adapter(&m, None, None).get_typed_value(&sel),
+            Some(TypedValue::Int(42)),
+        ));
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 
+use policy_rs::engine::TypedValue;
 use vector_lib::event::Value;
 
 // =============================================================================
@@ -34,6 +35,48 @@ pub(super) fn any_value_string(value: Option<&Value>) -> Option<Cow<'_, str>> {
         Some(s) if !s.is_empty() => Some(s),
         _ => None,
     }
+}
+
+/// Coerce an OTLP `AnyValue` to a `TypedValue` for `policy-rs`'s typed/numeric
+/// matchers (`equals`, `gt`, `gte`, `lt`, `lte`).
+///
+/// - `stringValue` (non-empty) → `TypedValue::String`
+/// - `boolValue` → `TypedValue::Bool`
+/// - `intValue` → `TypedValue::Int` (OTLP/JSON encodes int64 as a JSON string;
+///   protobuf decoding may yield a native integer — both shapes are accepted).
+/// - `doubleValue` → `TypedValue::Double` (same dual representation).
+/// - `bytesValue`, `arrayValue`, `kvlistValue` → `None`. `bytesValue` is
+///   base64-encoded in OTLP/JSON and `TypedValue::Bytes` is a non-owning borrow,
+///   so we'd have nowhere to anchor a decoded buffer; `arrayValue`/`kvlistValue`
+///   are containers that aren't matchable as scalars.
+pub(super) fn any_value_typed(value: Option<&Value>) -> Option<TypedValue<'_>> {
+    let obj = value?.as_object()?;
+
+    if let Some(s) = obj.get("stringValue").and_then(Value::as_str)
+        && !s.is_empty()
+    {
+        return Some(TypedValue::String(s));
+    }
+    if let Some(b) = obj.get("boolValue").and_then(Value::as_boolean) {
+        return Some(TypedValue::Bool(b));
+    }
+    if let Some(raw) = obj.get("intValue")
+        && let Some(i) = raw
+            .as_integer()
+            .or_else(|| raw.as_str().as_deref().and_then(|s| s.parse().ok()))
+    {
+        return Some(TypedValue::Int(i));
+    }
+    if let Some(raw) = obj.get("doubleValue")
+        && let Some(f) = raw
+            .as_float()
+            .map(|f| f.into_inner())
+            .or_else(|| raw.as_integer().map(|i| i as f64))
+            .or_else(|| raw.as_str().as_deref().and_then(|s| s.parse().ok()))
+    {
+        return Some(TypedValue::Double(f));
+    }
+    None
 }
 
 /// Whether an `AnyValue` carries any value variant at all. Powers
@@ -80,6 +123,32 @@ fn find_in_kvlist<'a>(attrs: &'a [Value], path: &[String]) -> Option<Cow<'a, str
             return any_value_string(value);
         }
         return nested_values(value).and_then(|nested| find_in_kvlist(nested, &path[1..]));
+    }
+    None
+}
+
+/// Like [`find_attribute_path`], but returns the leaf as a [`TypedValue`] so
+/// typed/numeric matchers see the underlying scalar type instead of a forced
+/// string.
+pub(super) fn find_attribute_typed_path<'a>(
+    attrs: Option<&'a Value>,
+    path: &[String],
+) -> Option<TypedValue<'a>> {
+    let array = attrs?.as_array()?;
+    find_typed_in_kvlist(array, path)
+}
+
+fn find_typed_in_kvlist<'a>(attrs: &'a [Value], path: &[String]) -> Option<TypedValue<'a>> {
+    let first = path.first()?;
+    for kv in attrs {
+        if !attribute_key_eq(kv, first) {
+            continue;
+        }
+        let value = kv.as_object().and_then(|o| o.get("value"));
+        if path.len() == 1 {
+            return any_value_typed(value);
+        }
+        return nested_values(value).and_then(|nested| find_typed_in_kvlist(nested, &path[1..]));
     }
     None
 }
@@ -274,5 +343,112 @@ mod tests {
         // Absent field, and a present-but-not-array field, both count as empty.
         assert!(array_field_is_empty(&v(json!({})), "a"));
         assert!(array_field_is_empty(&v(json!({"a": "x"})), "a"));
+    }
+
+    // -- typed-value coercion -------------------------------------------
+
+    fn typed_str<'a>(t: TypedValue<'a>) -> Option<Cow<'a, str>> {
+        if let TypedValue::String(s) = t { Some(s) } else { None }
+    }
+
+    #[test]
+    fn any_value_typed_string_returns_string_variant() {
+        let av = v(json!({"stringValue": "hi"}));
+        let typed = any_value_typed(Some(&av)).expect("typed value");
+        assert_eq!(typed_str(typed).as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn any_value_typed_empty_string_treated_as_absent() {
+        let av = v(json!({"stringValue": ""}));
+        assert!(any_value_typed(Some(&av)).is_none());
+    }
+
+    #[test]
+    fn any_value_typed_bool() {
+        let av = v(json!({"boolValue": true}));
+        assert!(matches!(
+            any_value_typed(Some(&av)),
+            Some(TypedValue::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn any_value_typed_int_from_json_string() {
+        // OTLP/JSON encodes int64 as a JSON string for JS safety.
+        let av = v(json!({"intValue": "42"}));
+        assert!(matches!(any_value_typed(Some(&av)), Some(TypedValue::Int(42))));
+    }
+
+    #[test]
+    fn any_value_typed_int_from_native_integer() {
+        // Protobuf decoding may yield a native integer rather than a string.
+        let av = v(json!({"intValue": 42}));
+        assert!(matches!(any_value_typed(Some(&av)), Some(TypedValue::Int(42))));
+    }
+
+    #[test]
+    fn any_value_typed_double_from_float_and_int() {
+        let av = v(json!({"doubleValue": 3.5}));
+        assert!(matches!(
+            any_value_typed(Some(&av)),
+            Some(TypedValue::Double(d)) if (d - 3.5).abs() < 1e-9,
+        ));
+        // Whole-number doubles may decode as Integer; we still recognise them.
+        let av = v(json!({"doubleValue": 5}));
+        assert!(matches!(
+            any_value_typed(Some(&av)),
+            Some(TypedValue::Double(d)) if (d - 5.0).abs() < 1e-9,
+        ));
+    }
+
+    #[test]
+    fn any_value_typed_container_variants_return_none() {
+        // bytesValue is base64-encoded and TypedValue::Bytes is non-owning, so
+        // we deliberately return None rather than match against the base64 form.
+        assert!(any_value_typed(Some(&v(json!({"bytesValue": "QUI="})))).is_none());
+        // Containers aren't matchable as scalars.
+        assert!(any_value_typed(Some(&v(json!({"arrayValue": {"values": []}})))).is_none());
+        assert!(any_value_typed(Some(&v(json!({"kvlistValue": {"values": []}})))).is_none());
+        // None input.
+        assert!(any_value_typed(None).is_none());
+    }
+
+    #[test]
+    fn find_attribute_typed_path_returns_typed_leaf() {
+        let attrs = v(json!([
+            {"key": "user_id", "value": {"stringValue": "abc"}},
+            {"key": "count", "value": {"intValue": "7"}},
+            {"key": "ratio", "value": {"doubleValue": 0.25}},
+            {"key": "ok", "value": {"boolValue": true}},
+            {"key": "http", "value": {"kvlistValue": {"values": [
+                {"key": "status", "value": {"intValue": 500}}
+            ]}}}
+        ]));
+        assert!(matches!(
+            find_attribute_typed_path(Some(&attrs), &["user_id".to_string()]),
+            Some(TypedValue::String(s)) if s == "abc",
+        ));
+        assert!(matches!(
+            find_attribute_typed_path(Some(&attrs), &["count".to_string()]),
+            Some(TypedValue::Int(7)),
+        ));
+        assert!(matches!(
+            find_attribute_typed_path(Some(&attrs), &["ratio".to_string()]),
+            Some(TypedValue::Double(d)) if (d - 0.25).abs() < 1e-9,
+        ));
+        assert!(matches!(
+            find_attribute_typed_path(Some(&attrs), &["ok".to_string()]),
+            Some(TypedValue::Bool(true)),
+        ));
+        assert!(matches!(
+            find_attribute_typed_path(
+                Some(&attrs),
+                &["http".to_string(), "status".to_string()],
+            ),
+            Some(TypedValue::Int(500)),
+        ));
+        // Missing keys still resolve to None.
+        assert!(find_attribute_typed_path(Some(&attrs), &["nope".to_string()]).is_none());
     }
 }

@@ -34,14 +34,14 @@ use std::borrow::Cow;
 use policy_rs::proto::tero::policy::v1::LogField;
 use policy_rs::{
     EvaluateResult, LogFieldSelector, Matchable, PolicyEngine, PolicySnapshot, Transformable,
-    engine::LogSignal,
+    engine::{LogSignal, TypedValue},
 };
 use vector_lib::event::{LogEvent, ObjectMap, Value};
 
 use super::internal_events::{DropCounts, DropReason, EvalErrors};
 use super::otlp_common::{
-    any_value_string, attribute_exists_path, attribute_key_eq, find_attribute_path, lift_child,
-    non_empty, reattach_child,
+    any_value_string, any_value_typed, attribute_exists_path, attribute_key_eq,
+    find_attribute_path, find_attribute_typed_path, lift_child, non_empty, reattach_child,
 };
 
 /// Iterate every record inside an OTLP envelope event, applying policies
@@ -256,6 +256,19 @@ impl Matchable for OtlpLogAdapter<'_> {
             | LogFieldSelector::ResourceAttribute(path)
             | LogFieldSelector::ScopeAttribute(path) => {
                 attribute_exists_path(self.attributes_for(field), path)
+            }
+        }
+    }
+
+    fn get_typed_value(&self, field: &LogFieldSelector) -> Option<TypedValue<'_>> {
+        match field {
+            LogFieldSelector::Simple(LogField::Body) => any_value_typed(self.log_record.get("body")),
+            LogFieldSelector::Simple(LogField::Unspecified) => None,
+            LogFieldSelector::Simple(_) => self.get_field(field).map(TypedValue::String),
+            LogFieldSelector::LogAttribute(path)
+            | LogFieldSelector::ResourceAttribute(path)
+            | LogFieldSelector::ScopeAttribute(path) => {
+                find_attribute_typed_path(self.attributes_for(field), path)
             }
         }
     }
@@ -579,6 +592,33 @@ mod tests {
         );
         // but exists: true must still match.
         assert!(adapter.field_exists(&LogFieldSelector::LogAttribute(vec!["count".into()])));
+    }
+
+    #[test]
+    fn int_attribute_surfaces_as_typed_int() {
+        // The same intValue that's invisible to string get_field must come
+        // back from get_typed_value as TypedValue::Int so numeric matchers fire.
+        let mut record = record_with_attr("count", any_int(42));
+        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        assert!(matches!(
+            adapter.get_typed_value(&LogFieldSelector::LogAttribute(vec!["count".into()])),
+            Some(TypedValue::Int(42)),
+        ));
+    }
+
+    #[test]
+    fn typed_value_on_body_any_value() {
+        // Body is an AnyValue too — a bool body must surface as TypedValue::Bool.
+        let mut body_obj = ObjectMap::new();
+        body_obj.insert("boolValue".into(), Value::Boolean(true));
+        let mut record = ObjectMap::new();
+        record.insert("body".into(), Value::Object(body_obj));
+        let mut record = Value::Object(record);
+        let adapter = OtlpLogAdapter::new(&mut record, None, None, None, None);
+        assert!(matches!(
+            adapter.get_typed_value(&LogFieldSelector::Simple(LogField::Body)),
+            Some(TypedValue::Bool(true)),
+        ));
     }
 
     #[test]

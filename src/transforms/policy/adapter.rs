@@ -13,7 +13,10 @@
 use std::borrow::Cow;
 
 use policy_rs::proto::tero::policy::v1::LogField;
-use policy_rs::{LogFieldSelector, Matchable, Transformable, engine::LogSignal};
+use policy_rs::{
+    LogFieldSelector, Matchable, Transformable,
+    engine::{LogSignal, TypedValue},
+};
 use vector_lib::{
     event::{LogEvent, Value},
     lookup::{OwnedValuePath, PathPrefix},
@@ -94,6 +97,12 @@ impl Matchable for VectorLogAdapter<'_> {
         };
         self.log.get((PathPrefix::Event, path.as_ref())).is_some()
     }
+
+    fn get_typed_value(&self, field: &LogFieldSelector) -> Option<TypedValue<'_>> {
+        let path = value_path(self.mapping, field)?;
+        let value = self.log.get((PathPrefix::Event, path.as_ref()))?;
+        value_to_typed(value)
+    }
 }
 
 impl Transformable for VectorLogAdapter<'_> {
@@ -142,6 +151,30 @@ fn value_to_match_string(value: &Value) -> Option<Cow<'_, str>> {
         Value::Integer(i) => Some(Cow::Owned(i.to_string())),
         Value::Float(f) => Some(Cow::Owned(f.to_string())),
         Value::Boolean(b) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
+        Value::Timestamp(_)
+        | Value::Object(_)
+        | Value::Array(_)
+        | Value::Regex(_)
+        | Value::Null => None,
+    }
+}
+
+/// Coerce a `LogEvent` value to the matching `TypedValue` variant for
+/// `policy-rs`'s typed/numeric matchers (`equals`, `gt`, `gte`, `lt`, `lte`).
+///
+/// `Value::Bytes` becomes `TypedValue::String` when it's valid UTF-8 (the
+/// representation Vector uses for human-typed strings) and `TypedValue::Bytes`
+/// otherwise. Containers, timestamps, nulls, and regexes return `None`; the
+/// engine treats that as a non-match, not an error.
+fn value_to_typed(value: &Value) -> Option<TypedValue<'_>> {
+    match value {
+        Value::Bytes(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => Some(TypedValue::String(Cow::Borrowed(s))),
+            Err(_) => Some(TypedValue::Bytes(bytes.as_ref())),
+        },
+        Value::Integer(i) => Some(TypedValue::Int(*i)),
+        Value::Float(f) => Some(TypedValue::Double(f.into_inner())),
+        Value::Boolean(b) => Some(TypedValue::Bool(*b)),
         Value::Timestamp(_)
         | Value::Object(_)
         | Value::Array(_)
@@ -871,5 +904,76 @@ mod tests {
             log.get("scope.attributes.renamed").and_then(|v| v.as_str()),
             Some("x".into()),
         );
+    }
+
+    // -- typed-value coercion -------------------------------------------
+
+    #[test]
+    fn value_to_typed_maps_each_scalar_variant() {
+        use vector_lib::event::Value;
+
+        assert!(matches!(
+            value_to_typed(&Value::Bytes("hi".into())),
+            Some(TypedValue::String(s)) if s == "hi",
+        ));
+        // Invalid UTF-8 falls through to Bytes.
+        let raw = Value::Bytes(vec![0xff, 0xfe, 0xfd].into());
+        assert!(matches!(
+            value_to_typed(&raw),
+            Some(TypedValue::Bytes(b)) if b == [0xff, 0xfe, 0xfd],
+        ));
+        assert!(matches!(
+            value_to_typed(&Value::Integer(42)),
+            Some(TypedValue::Int(42))
+        ));
+        assert!(matches!(
+            value_to_typed(&Value::Float(
+                ordered_float::NotNan::new(2.5).unwrap()
+            )),
+            Some(TypedValue::Double(d)) if (d - 2.5).abs() < 1e-9,
+        ));
+        assert!(matches!(
+            value_to_typed(&Value::Boolean(false)),
+            Some(TypedValue::Bool(false))
+        ));
+        // Non-scalar/non-matchable variants yield None.
+        assert!(value_to_typed(&Value::Null).is_none());
+        assert!(value_to_typed(&Value::Object(Default::default())).is_none());
+        assert!(value_to_typed(&Value::Array(Vec::new())).is_none());
+        assert!(value_to_typed(&Value::Timestamp(Utc::now())).is_none());
+    }
+
+    #[test]
+    fn get_typed_value_surfaces_native_attribute_types() {
+        // The shared `make_log` fixture inserts an integer, a bool, and a float
+        // under `attributes.*`. They must come back as the matching TypedValue
+        // variant, not stringified.
+        let mut log = make_log();
+        let m = mapping();
+        let adapter = VectorLogAdapter::new(&mut log, &m);
+
+        // `user_id` was inserted as the string "42" — stays a TypedValue::String.
+        assert!(matches!(
+            adapter.get_typed_value(&LogFieldSelector::LogAttribute(
+                vec!["user_id".to_string()],
+            )),
+            Some(TypedValue::String(s)) if s == "42",
+        ));
+        assert!(matches!(
+            adapter.get_typed_value(&LogFieldSelector::LogAttribute(
+                vec!["flagged".to_string()],
+            )),
+            Some(TypedValue::Bool(true)),
+        ));
+        assert!(matches!(
+            adapter.get_typed_value(&LogFieldSelector::LogAttribute(
+                vec!["ratio".to_string()],
+            )),
+            Some(TypedValue::Double(d)) if (d - 1.5).abs() < 1e-9,
+        ));
+        // Absent attribute → None.
+        assert!(adapter
+            .get_typed_value(&LogFieldSelector::LogAttribute(vec!["missing".to_string()]))
+            .is_none());
     }
 }
