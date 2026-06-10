@@ -348,7 +348,11 @@ mod tests {
     // -- typed-value coercion -------------------------------------------
 
     fn typed_str<'a>(t: TypedValue<'a>) -> Option<Cow<'a, str>> {
-        if let TypedValue::String(s) = t { Some(s) } else { None }
+        if let TypedValue::String(s) = t {
+            Some(s)
+        } else {
+            None
+        }
     }
 
     #[test]
@@ -377,14 +381,20 @@ mod tests {
     fn any_value_typed_int_from_json_string() {
         // OTLP/JSON encodes int64 as a JSON string for JS safety.
         let av = v(json!({"intValue": "42"}));
-        assert!(matches!(any_value_typed(Some(&av)), Some(TypedValue::Int(42))));
+        assert!(matches!(
+            any_value_typed(Some(&av)),
+            Some(TypedValue::Int(42))
+        ));
     }
 
     #[test]
     fn any_value_typed_int_from_native_integer() {
         // Protobuf decoding may yield a native integer rather than a string.
         let av = v(json!({"intValue": 42}));
-        assert!(matches!(any_value_typed(Some(&av)), Some(TypedValue::Int(42))));
+        assert!(matches!(
+            any_value_typed(Some(&av)),
+            Some(TypedValue::Int(42))
+        ));
     }
 
     #[test]
@@ -442,10 +452,7 @@ mod tests {
             Some(TypedValue::Bool(true)),
         ));
         assert!(matches!(
-            find_attribute_typed_path(
-                Some(&attrs),
-                &["http".to_string(), "status".to_string()],
-            ),
+            find_attribute_typed_path(Some(&attrs), &["http".to_string(), "status".to_string()],),
             Some(TypedValue::Int(500)),
         ));
         // Missing keys still resolve to None.

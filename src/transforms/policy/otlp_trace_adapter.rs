@@ -561,9 +561,8 @@ mod tests {
 
     #[test]
     fn typed_value_surfaces_int_span_attribute() {
-        let mut span = val(
-            json!({"attributes": [{"key": "http.status_code", "value": {"intValue": "500"}}]}),
-        );
+        let mut span =
+            val(json!({"attributes": [{"key": "http.status_code", "value": {"intValue": "500"}}]}));
         let adapter = TraceAdapter {
             span: &mut span,
             resource: None,

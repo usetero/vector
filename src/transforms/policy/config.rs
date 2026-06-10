@@ -453,7 +453,10 @@ path = "/dev/null"
     }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
     }
 
     fn policy_config_with_metadata(client_metadata: ClientMetadata) -> PolicyConfig {

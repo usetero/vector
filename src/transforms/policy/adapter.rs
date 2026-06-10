@@ -960,9 +960,7 @@ mod tests {
             Some(TypedValue::String(s)) if s == "42",
         ));
         assert!(matches!(
-            adapter.get_typed_value(&LogFieldSelector::LogAttribute(
-                vec!["flagged".to_string()],
-            )),
+            adapter.get_typed_value(&LogFieldSelector::LogAttribute(vec!["flagged".to_string()],)),
             Some(TypedValue::Bool(true)),
         ));
         assert!(matches!(
@@ -972,8 +970,10 @@ mod tests {
             Some(TypedValue::Double(d)) if (d - 1.5).abs() < 1e-9,
         ));
         // Absent attribute → None.
-        assert!(adapter
-            .get_typed_value(&LogFieldSelector::LogAttribute(vec!["missing".to_string()]))
-            .is_none());
+        assert!(
+            adapter
+                .get_typed_value(&LogFieldSelector::LogAttribute(vec!["missing".to_string()]))
+                .is_none()
+        );
     }
 }

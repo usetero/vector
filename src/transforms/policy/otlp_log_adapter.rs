@@ -262,7 +262,9 @@ impl Matchable for OtlpLogAdapter<'_> {
 
     fn get_typed_value(&self, field: &LogFieldSelector) -> Option<TypedValue<'_>> {
         match field {
-            LogFieldSelector::Simple(LogField::Body) => any_value_typed(self.log_record.get("body")),
+            LogFieldSelector::Simple(LogField::Body) => {
+                any_value_typed(self.log_record.get("body"))
+            }
             LogFieldSelector::Simple(LogField::Unspecified) => None,
             LogFieldSelector::Simple(_) => self.get_field(field).map(TypedValue::String),
             LogFieldSelector::LogAttribute(path)
