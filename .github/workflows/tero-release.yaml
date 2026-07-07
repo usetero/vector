@@ -83,7 +83,7 @@ jobs:
             triple: aarch64-unknown-linux-gnu
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install build dependencies
         # Vectorscan (via `vectorscan-rs-sys`) needs cmake + a C++ toolchain
@@ -115,7 +115,7 @@ jobs:
 
       - name: Install Rust toolchain
         # rust-toolchain.toml pins the channel — the action respects it.
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@11cc3f2199c70edc9a5e89f2d1fc84b7a5cdd97b # v1
         with:
           rustflags: ""
 
@@ -166,7 +166,7 @@ jobs:
         run: "./target/${TRIPLE}/release/vector --version"
 
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@65462800fd760bbe4ee195a5d60d2da9c6f4af95 # v4
         with:
           name: vector-binary-${{ matrix.arch }}
           path: |
@@ -176,7 +176,7 @@ jobs:
           retention-days: 1
 
       - name: Upload bare binary for Docker stage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@65462800fd760bbe4ee195a5d60d2da9c6f4af95 # v4
         with:
           name: vector-bin-${{ matrix.arch }}
           path: target/${{ matrix.triple }}/release/vector
@@ -200,10 +200,10 @@ jobs:
             platform: linux/arm64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download binary for this arch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           name: vector-bin-${{ matrix.arch }}
           path: ${{ matrix.arch }}/
@@ -221,7 +221,7 @@ jobs:
 
       - name: Log in to Container Registry
         if: ${{ !inputs.dry_run }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed129e7d61c3fba31b68bf0 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -260,7 +260,7 @@ jobs:
     if: ${{ !inputs.dry_run }}
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           path: /tmp/digests
           pattern: digests-*
@@ -270,7 +270,7 @@ jobs:
         uses: useblacksmith/setup-docker-builder@v1
 
       - name: Log in to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed129e7d61c3fba31b68bf0 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -278,7 +278,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8acb49a15cfc25f # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
