@@ -83,7 +83,7 @@ jobs:
             triple: aarch64-unknown-linux-gnu
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install build dependencies
         # Vectorscan (via `vectorscan-rs-sys`) needs cmake + a C++ toolchain
@@ -115,7 +115,7 @@ jobs:
 
       - name: Install Rust toolchain
         # rust-toolchain.toml pins the channel — the action respects it.
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@11cc3f2199c70edc9a5e89f2d1fc84b7a5cdd97b # v1
         with:
           rustflags: ""
 
@@ -124,7 +124,7 @@ jobs:
         # network — roughly an order of magnitude faster than actions/cache@v4
         # for multi-GB `target/` payloads and not subject to GitHub's 10 GB
         # per-repo cache cap.
-        uses: useblacksmith/cache@v5
+        uses: useblacksmith/cache@d70f513405ada4651da6a85c4d4573d6f682a3d7 # v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -166,7 +166,7 @@ jobs:
         run: "./target/${TRIPLE}/release/vector --version"
 
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@65462800fd760bbe4ee195a5d60d2da9c6f4af95 # v4
         with:
           name: vector-binary-${{ matrix.arch }}
           path: |
@@ -176,7 +176,7 @@ jobs:
           retention-days: 1
 
       - name: Upload bare binary for Docker stage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@65462800fd760bbe4ee195a5d60d2da9c6f4af95 # v4
         with:
           name: vector-bin-${{ matrix.arch }}
           path: target/${{ matrix.triple }}/release/vector
@@ -200,10 +200,10 @@ jobs:
             platform: linux/arm64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download binary for this arch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           name: vector-bin-${{ matrix.arch }}
           path: ${{ matrix.arch }}/
@@ -217,11 +217,11 @@ jobs:
         # Blacksmith's setup-docker-builder wraps buildx and points the build
         # cache at Blacksmith's colocated layer cache, so we drop the manual
         # `cache-from`/`cache-to: type=gha` below — it's handled automatically.
-        uses: useblacksmith/setup-docker-builder@v1
+        uses: useblacksmith/setup-docker-builder@ab5c1da94f53f5cd75c1038092aa276dddfccbba # v1
 
       - name: Log in to Container Registry
         if: ${{ !inputs.dry_run }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed129e7d61c3fba31b68bf0 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -229,7 +229,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: useblacksmith/build-push-action@v2
+        uses: useblacksmith/build-push-action@77a6a48abcaa2cfb9e7fb530f9de9d91b3e7e74b # v2
         with:
           context: .
           file: distribution/docker/tero/Dockerfile
@@ -246,7 +246,7 @@ jobs:
 
       - name: Upload digest
         if: ${{ !inputs.dry_run }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@65462800fd760bbe4ee195a5d60d2da9c6f4af95 # v4
         with:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
@@ -260,17 +260,17 @@ jobs:
     if: ${{ !inputs.dry_run }}
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           path: /tmp/digests
           pattern: digests-*
           merge-multiple: true
 
       - name: Set up Blacksmith Docker builder
-        uses: useblacksmith/setup-docker-builder@v1
+        uses: useblacksmith/setup-docker-builder@ab5c1da94f53f5cd75c1038092aa276dddfccbba # v1
 
       - name: Log in to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed129e7d61c3fba31b68bf0 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -278,7 +278,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8acb49a15cfc25f # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -310,7 +310,7 @@ jobs:
       contents: write
     steps:
       - name: Download binary tarballs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           path: /tmp/assets
           pattern: vector-binary-*
